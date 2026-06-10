@@ -1,0 +1,77 @@
+[package]
+name = "file_indexer"
+version = "0.1.0"
+edition = "2024"
+
+# ── Step 1 deps (storage) ─────────────────────────────────────────────────────
+[dependencies]
+# Error handling — defines IndexerError enum used across all modules
+thiserror = "2"
+
+# Byte buffer abstraction (zero-copy slices via Bytes::slice)
+bytes = "1"
+
+# Async runtime for I/O-bound storage backends (Google Drive in Phase 2)
+tokio = { version = "1", features = ["full"] }
+
+# CPU-bound parallelism (chunking, embedding) — added here so storage streams
+# can be fed directly into rayon parallel iterators in later steps
+rayon = "1"
+
+# Structured, leveled logging (replaces Python's logging.getLogger)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Step 2 deps (db) — declared now so Cargo resolves the full graph once ─────
+rusqlite = { version = "0.39", features = ["bundled-full", "vtab"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.34"
+
+# ── Step 3 deps (chunker) ─────────────────────────────────────────────────────
+calamine  = { version = "0.35", features = ["dates"] }
+pulldown-cmark = "0.12"
+encoding_rs = "0.8"          # robust charset detection for CSV streams
+csv = "1"                    # RFC-4180 CSV parser (used in parse_csv)
+
+# ── Step 4 deps (indexer / embedder) ─────────────────────────────────────────
+ort       = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+tokenizers = "0.23"
+ndarray   = "0.16"
+lancedb   = "0.27"
+arrow     = { version = "57", features = ["prettyprint"] }
+arrow-array  = "57"
+arrow-schema = "57"
+
+# Reservoir sampling, hashing, serialisation
+rand       = "0.9"
+sha2       = "0.10"
+md-5       = "0.10"
+hex        = "0.4"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async streams for listing files (Google Drive Phase 2)
+futures = "0.3"
+async-trait = "0.1"
+
+# gitignore-aware directory walking (replaces hand-rolled LocalWalker)
+ignore = "0.4"
+
+# ── Step 5 deps (search / CLI) ────────────────────────────────────────────────
+clap = { version = "4", features = ["derive"] }
+
+# ── Step 8 deps (TUI) ─────────────────────────────────────────────────────────
+ratatui   = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# ── Step 9 deps (self-healing indexer) ───────────────────────────────────────
+toml = { version = "0.8", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"
+rust_xlsxwriter = "0.78"    # creates in-memory XLSX for chunker tests
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
