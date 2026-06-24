@@ -16,7 +16,14 @@ jobs:
 
       - name: Install protoc
         # lance-encoding's build script compiles .proto files and needs protoc.
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # `apt-get update` is allowed to fail: preinstalled third-party apt
+        # sources on the runner (e.g. packages.microsoft.com/azure-cli) sometimes
+        # 403/expire and abort the whole refresh. The base Ubuntu lists that
+        # carry protobuf-compiler still fetch, so the install below is the real
+        # gate — it fails loudly if the package is genuinely unavailable.
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -51,7 +58,14 @@ jobs:
 
       - name: Install protoc
         # lance-encoding's build script compiles .proto files and needs protoc.
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # `apt-get update` is allowed to fail: preinstalled third-party apt
+        # sources on the runner (e.g. packages.microsoft.com/azure-cli) sometimes
+        # 403/expire and abort the whole refresh. The base Ubuntu lists that
+        # carry protobuf-compiler still fetch, so the install below is the real
+        # gate — it fails loudly if the package is genuinely unavailable.
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
