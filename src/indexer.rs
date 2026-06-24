@@ -587,6 +587,29 @@ pub struct Stats {
     pub vec_total: usize,
 }
 
+// ── Push ingress ────────────────────────────────────────────────────────────────
+
+/// A single pre-fetched record handed to the push ingress (`index_records`).
+///
+/// Unlike the pull path, the bytes are supplied by the caller (never read from a
+/// `StorageClient`), and `meta` is caller-owned record-level metadata merged onto
+/// every chunk's `meta` under the reserved `"record"` key — so it returns on every
+/// search hit via `ChunkRow.meta`/`FtsResult.meta`.
+#[derive(Debug, Clone)]
+pub struct IngestRecord {
+    /// Caller-chosen identity, e.g. `"change://105/etc/nginx.conf@2026-06-22T18:03:01Z"`.
+    /// Load-bearing: distinct URIs accumulate history; a reused URI overwrites.
+    pub uri:         String,
+    /// Bytes the caller already holds (a redacted diff, a rendered config, …).
+    pub content:     Vec<u8>,
+    /// Explicit MIME — there is no extension to dispatch on. Use a `text/*` type.
+    pub mime_type:   String,
+    /// Caller's logical timestamp (secs since epoch). Defaults to now if `None`.
+    pub modified_at: Option<f64>,
+    /// Record-level metadata, merged onto every chunk's `meta`.
+    pub meta:        serde_json::Value,
+}
+
 // ── IncrementalIndexer ────────────────────────────────────────────────────────
 
 pub struct IncrementalIndexer {
@@ -708,6 +731,7 @@ impl IncrementalIndexer {
                     }
                     self.write_file(
                         &meta, &hash, chunk_result, &chunker_method,
+                        &serde_json::Value::Null,
                         &mut text_buffer, &mut lance_id_buf,
                         &mut chunk_id_buf, &mut tier_buf,
                     )?;
@@ -765,12 +789,14 @@ impl IncrementalIndexer {
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_file(
         &self,
         meta:           &crate::storage::FileMetadata,
         content_hash:   &str,
         chunk_result:   ChunkResult,
         chunker_method: &str,
+        record_meta:    &serde_json::Value,
         text_buf:       &mut Vec<String>,
         lance_id_buf:   &mut Vec<i64>,
         chunk_id_buf:   &mut Vec<i64>,
@@ -798,7 +824,7 @@ impl IncrementalIndexer {
             chunk_index:    c.chunk_index,
             content:        c.content.clone(),
             token_count:    Some(c.token_count),
-            meta:           c.meta.clone(),
+            meta:           merge_record_meta(&c.meta, record_meta),
             chunker_method: Some(chunker_method.to_string()),
         }).collect();
 
@@ -855,6 +881,7 @@ impl IncrementalIndexer {
                     }
                     self.write_file(
                         &meta, &hash, chunk_result, &chunker_method,
+                        &serde_json::Value::Null,
                         &mut text_buffer, &mut lance_id_buf,
                         &mut chunk_id_buf, &mut tier_buf,
                     )?;
@@ -865,6 +892,103 @@ impl IncrementalIndexer {
 
         if !text_buffer.is_empty() {
             self.flush_embeddings(&text_buffer, &lance_id_buf, &chunk_id_buf, &tier_buf).await?;
+        }
+
+        stats.vec_total = self.vectors.ntotal().await?;
+        Ok(stats)
+    }
+
+    /// Push ingress: index caller-supplied records that are **not** walkable
+    /// files. Reuses the pull pipeline from chunking onward (`FileChunker::chunk`
+    /// → meta-aware `write_file` → `flush_embeddings`) but synthesizes
+    /// `FileMetadata` from each record instead of reading a `StorageClient`, and
+    /// threads the record's `meta` onto every chunk.
+    ///
+    /// A pushed record is authoritative — always chunked and embedded, with no
+    /// mtime/MD5 skip (that is a *pull* optimization keyed on re-walking a path).
+    /// Re-pushing the same `uri` overwrites that record's chunks and vectors;
+    /// distinct URIs accumulate. Unlike `index_uris`, this rebuilds the IVF-PQ
+    /// index at the end, because a push feed accumulates vectors over time.
+    pub async fn index_records(&self, records: &[IngestRecord]) -> Result<Stats, IndexerError> {
+        if records.is_empty() {
+            return Ok(Stats::default());
+        }
+
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let mut stats = Stats::default();
+        let all_info  = self.db.get_all_file_info()?;
+
+        let mut text_buffer:  Vec<String> = Vec::new();
+        let mut lance_id_buf: Vec<i64>    = Vec::new();
+        let mut chunk_id_buf: Vec<i64>    = Vec::new();
+        let mut tier_buf:     Vec<u8>     = Vec::new();
+
+        for record in records {
+            // Synthetic metadata — never touches StorageClient. `name` is the
+            // last URI segment for display; falls back to the whole URI.
+            let name = record.uri
+                .rsplit(|c| c == '/' || c == '\\')
+                .find(|s| !s.is_empty())
+                .unwrap_or(record.uri.as_str())
+                .to_string();
+            let meta = crate::storage::FileMetadata {
+                file_uri:    record.uri.clone(),
+                name,
+                mime_type:   record.mime_type.clone(),
+                size_bytes:  record.content.len() as u64,
+                modified_at: record.modified_at.unwrap_or(now),
+            };
+
+            let hash = md5_hex(&record.content);
+            let (chunk_result, chunker_method) =
+                match self.chunker.chunk(&record.content, &meta, &self.chunker_map) {
+                    Ok(r)  => r,
+                    Err(e) => {
+                        tracing::warn!("Chunker error for {}: {}", record.uri, e);
+                        stats.errors += 1;
+                        continue;
+                    }
+                };
+
+            // Evict stale LanceDB vectors on re-push: `write_file` clears only the
+            // SQLite chunks, so without this the prior record's vectors are
+            // orphaned (the ghost-vector bug the pull path guards against).
+            if let Some(info) = all_info.get(record.uri.as_str()) {
+                let old_ids = self.db.get_lance_ids_for_file(info.file_id)?;
+                self.vectors.remove_ids(&old_ids).await?;
+            }
+
+            self.write_file(
+                &meta, &hash, chunk_result, &chunker_method,
+                &record.meta,
+                &mut text_buffer, &mut lance_id_buf,
+                &mut chunk_id_buf, &mut tier_buf,
+            )?;
+            stats.indexed += 1;
+
+            if text_buffer.len() >= EMBED_BATCH_SIZE {
+                self.flush_embeddings(&text_buffer, &lance_id_buf, &chunk_id_buf, &tier_buf).await?;
+                text_buffer.clear();
+                lance_id_buf.clear();
+                chunk_id_buf.clear();
+                tier_buf.clear();
+            }
+        }
+
+        if !text_buffer.is_empty() {
+            self.flush_embeddings(&text_buffer, &lance_id_buf, &chunk_id_buf, &tier_buf).await?;
+        }
+
+        // Rebuild IVF-PQ so a growing push feed keeps correct ANN recall.
+        let ntotal = self.vectors.ntotal().await?;
+        if ntotal >= TRAIN_MIN {
+            let nlist = compute_nlist(ntotal);
+            let _ = self.vectors.create_ivf_pq_index(nlist).await;
         }
 
         stats.vec_total = self.vectors.ntotal().await?;
@@ -919,6 +1043,26 @@ fn md5_hex(data: &[u8]) -> String {
     let mut h = Md5::new();
     h.update(data);
     format!("{:x}", h.finalize())
+}
+
+/// Shallow-merge caller-supplied record metadata into a chunk's chunker-derived
+/// meta under the reserved `"record"` key. A `Value::Null` `record_meta` is a
+/// no-op that returns the chunker meta unchanged — this is what the pull path
+/// passes, keeping its `chunks.meta` byte-for-byte identical to before the push
+/// path existed. The reserved key never collides with chunker-emitted keys.
+fn merge_record_meta(
+    chunk_meta:  &serde_json::Value,
+    record_meta: &serde_json::Value,
+) -> serde_json::Value {
+    if record_meta.is_null() {
+        return chunk_meta.clone();
+    }
+    let mut obj = match chunk_meta {
+        serde_json::Value::Object(m) => m.clone(),
+        _                            => serde_json::Map::new(),
+    };
+    obj.insert("record".to_string(), record_meta.clone());
+    serde_json::Value::Object(obj)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1072,5 +1216,76 @@ mod tests {
 
         let stats2   = indexer.index_root(&root_dir.path().to_string_lossy(), false, None, None).await.unwrap();
         assert_eq!(stats2.indexed, 0, "second run should skip unchanged file");
+    }
+
+    // Push ingress: runs WITHOUT a model. The embedder is optional, so a pushed
+    // record still produces SQLite chunks + FTS rows (BM25-searchable), and the
+    // record metadata round-trips onto every chunk — no NOMIC_ONNX_PATH needed.
+    #[tokio::test]
+    async fn index_records_pushes_searchable_chunks_with_meta() {
+        use crate::storage::LocalStorageClient;
+
+        let idx_dir = TempDir::new().unwrap();
+        // The push path never touches storage, but the constructor requires one.
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path()).await.unwrap();
+
+        let uri = "change://105/etc/nginx.conf@2026-06-22T18:03:01Z";
+        let record = IngestRecord {
+            uri:         uri.to_string(),
+            content:     b"server_name example.com;\nlisten 443 ssl;\nproxy_pass http://backend;\n".to_vec(),
+            mime_type:   "text/plain".to_string(),
+            modified_at: Some(1_700_000_000.0),
+            meta:        serde_json::json!({ "tool": "write_file", "pre_hash": "abc", "vmid": 105 }),
+        };
+
+        let stats = indexer.index_records(&[record]).await.unwrap();
+        assert_eq!(stats.indexed, 1, "one record should be indexed");
+
+        // Chunks landed in SQLite and carry the record metadata under "record".
+        let chunks = indexer.db.get_chunks_for_file(uri).unwrap();
+        assert!(!chunks.is_empty(), "pushed record should produce chunks");
+        let t12 = chunks.iter().find(|c| c.tier == 1 || c.tier == 2)
+            .expect("expected at least one Tier-1/2 chunk");
+        assert_eq!(t12.meta["record"]["tool"], "write_file");
+        assert_eq!(t12.meta["record"]["vmid"], 105);
+
+        // FTS5/BM25 finds the content with no embedding model loaded, and the
+        // record meta round-trips on the FTS result too (the consumer's pivot).
+        let hits = indexer.db.fts_search("backend", 10).unwrap();
+        let hit  = hits.iter().find(|h| h.file_uri == uri)
+            .expect("pushed record should be BM25-searchable without a model");
+        assert_eq!(hit.meta["record"]["tool"], "write_file");
+    }
+
+    // Re-pushing the same URI is an overwrite, not an accumulation: the old
+    // chunks are replaced (delete_chunks_for_file), so the count stays stable
+    // and the content reflects the latest push.
+    #[tokio::test]
+    async fn index_records_repush_same_uri_overwrites() {
+        use crate::storage::LocalStorageClient;
+
+        let idx_dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path()).await.unwrap();
+
+        let uri = "change://1/config";
+        let mk  = |body: &str| IngestRecord {
+            uri:         uri.to_string(),
+            content:     body.as_bytes().to_vec(),
+            mime_type:   "text/plain".to_string(),
+            modified_at: None,
+            meta:        serde_json::Value::Null,
+        };
+
+        indexer.index_records(&[mk("alpha token original")]).await.unwrap();
+        indexer.index_records(&[mk("beta token replacement")]).await.unwrap();
+
+        // Old content is gone; new content is searchable.
+        assert!(indexer.db.fts_search("original", 10).unwrap().is_empty(),
+            "original content should be overwritten");
+        assert!(indexer.db.fts_search("replacement", 10).unwrap()
+            .iter().any(|h| h.file_uri == uri),
+            "replacement content should be searchable");
     }
 }
