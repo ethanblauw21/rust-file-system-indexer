@@ -238,7 +238,7 @@ async fn dense_search_by_vec(
 
     let mut results: Vec<SearchResult> = chunk_map
         .into_values()
-        .filter(|c| tier.map_or(true, |t| c.tier == t))
+        .filter(|c| tier.is_none_or(|t| c.tier == t))
         .filter(|c| matches_ext(&c.file_uri, ext_filter))
         .map(|chunk| {
             let dense_score = chunk.lance_id.and_then(|lid| score_map.get(&lid).copied());
@@ -338,6 +338,7 @@ pub fn sparse_search(
 
 // ── Hybrid search (RRF) ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn hybrid_search(
     query:          &str,
     top_k:          usize,

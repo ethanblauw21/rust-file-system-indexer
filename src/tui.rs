@@ -144,12 +144,11 @@ impl App {
     ) -> io::Result<()> {
         loop {
             // Fire debounce if deadline passed
-            if let Some(dl) = self.debounce_deadline {
-                if Instant::now() >= dl {
+            if let Some(dl) = self.debounce_deadline
+                && Instant::now() >= dl {
                     self.debounce_deadline = None;
                     self.execute_search().await;
                 }
-            }
 
             // Drain index/score progress (non-blocking)
             self.drain_progress();
@@ -259,9 +258,8 @@ impl App {
             KeyCode::Char('q') => return true,
             KeyCode::Esc       => { self.screen = Screen::Search; self.scores_data = None; }
             KeyCode::Up        => { self.scores_scroll = self.scores_scroll.saturating_sub(1); }
-            KeyCode::Down      => {
-                if self.scores_scroll + 1 < row_count { self.scores_scroll += 1; }
-            }
+            KeyCode::Down
+                if self.scores_scroll + 1 < row_count => { self.scores_scroll += 1; }
             _ => {}
         }
         false
@@ -468,13 +466,12 @@ impl App {
                 }
             }
             KeyCode::Char('e') => {
-                if let Some(data) = &self.explain_data {
-                    if self.explain_chunk_sel < data.chunks.len() {
+                if let Some(data) = &self.explain_data
+                    && self.explain_chunk_sel < data.chunks.len() {
                         self.chunk_preview = Some(data.chunks[self.explain_chunk_sel].content.clone());
                         self.chunk_preview_scroll = 0;
                         self.screen = Screen::ChunkPreview;
                     }
-                }
             }
             _ => {}
         }
@@ -635,11 +632,10 @@ impl App {
     // ── Rendering ─────────────────────────────────────────────────────────────
 
     fn render(&mut self, f: &mut Frame) {
-        if let Some((_, ts)) = &self.status_msg {
-            if ts.elapsed().as_secs() >= 3 {
+        if let Some((_, ts)) = &self.status_msg
+            && ts.elapsed().as_secs() >= 3 {
                 self.status_msg = None;
             }
-        }
 
         let area  = f.area();
         let mode  = self.mode_label();
@@ -952,7 +948,7 @@ impl App {
         let w        = inner.width as usize;
         // fixed columns: rank(4) str(5) coh(5) flag(1) tier(2) spaces+sep ≈ 22; rest for source+preview
         let rest     = w.saturating_sub(26);
-        let src_w    = (rest / 2).max(16).min(36);
+        let src_w    = (rest / 2).clamp(16, 36);
         let prev_w   = rest.saturating_sub(src_w).max(10);
 
         let sep = "\u{2500}".repeat(w.min(6 + 6 + 2 + 3 + src_w + 2 + prev_w));

@@ -2,7 +2,6 @@ use crate::error::IndexerError;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
-use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -30,8 +29,10 @@ pub struct ChunkRow {
     pub meta: serde_json::Value,
     pub lance_id: Option<i64>,
     pub file_uri: String,
+    #[allow(dead_code)]
     pub mime_type: String,
     pub is_flagged: bool,
+    #[allow(dead_code)]
     pub chunker_method: Option<String>,
     pub structural_score: Option<f32>,
     pub coherence_score: Option<f32>,

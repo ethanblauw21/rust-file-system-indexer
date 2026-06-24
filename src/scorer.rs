@@ -142,7 +142,7 @@ pub async fn score_all(
         let c = coherence_score(chunk, db, lance).await;
 
         let struct_bad = s < STRUCTURAL_THRESHOLD;
-        let coher_bad  = c.map_or(false, |v| v < COHERENCE_THRESHOLD);
+        let coher_bad  = c.is_some_and(|v| v < COHERENCE_THRESHOLD);
         let is_flagged = struct_bad || coher_bad;
 
         db.set_chunk_scores(chunk.id, s, c, is_flagged)?;
@@ -157,11 +157,10 @@ pub async fn score_all(
             }
         }
 
-        if let Some(f) = on_progress {
-            if i % 50 == 49 || i + 1 == total {
+        if let Some(f) = on_progress
+            && (i % 50 == 49 || i + 1 == total) {
                 f(i + 1, total);
             }
-        }
     }
 
     Ok(ScoreStats { total, flagged, structural_only, coherence_only, both })

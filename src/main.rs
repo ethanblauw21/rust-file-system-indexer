@@ -511,8 +511,8 @@ fn print_table(
     }
 
     println!(
-        "  {:>3}  {:>6}  {:>4}  {:<40}  {}",
-        "#", "Score", "Tier", "Source", "Preview"
+        "  {:>3}  {:>6}  {:>4}  {:<40}  Preview",
+        "#", "Score", "Tier", "Source"
     );
     println!("  {}", "─".repeat(96));
 
@@ -788,8 +788,8 @@ async fn run_scores_show(
     );
 
     println!(
-        "  {:>4}  {:>5}  {:>5}  {:>1}  {:<4}  {:<40}  {}",
-        "#", "str", "coh", "F", "Tier", "Source", "Preview"
+        "  {:>4}  {:>5}  {:>5}  {:>1}  {:<4}  {:<40}  Preview",
+        "#", "str", "coh", "F", "Tier", "Source"
     );
     println!("  {}", "─".repeat(100));
 
@@ -888,7 +888,7 @@ async fn run_recheck(index_dir: PathBuf, dry_run: bool) {
 
     // Tally drift counts by (old → new) for the report.
     let mut drift_counts: HashMap<(String, String), usize> = HashMap::new();
-    for (_, (old, new)) in &drift_map {
+    for (old, new) in drift_map.values() {
         *drift_counts.entry((old.clone(), new.clone())).or_insert(0) += 1;
     }
 
