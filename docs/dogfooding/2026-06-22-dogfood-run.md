@@ -220,3 +220,31 @@ After fixing D6, the durable union was rebuilt across 4 roots (`codebase-indexer
 Weighted hybrid at `0.4` **dominates the old unweighted fusion on every aggregate** and **beats pure dense** on robustness, total top-3 precision, and top-10 recall — combining dense's base precision with sparse's synonym rescue (synonym top-3 8→11 vs dense). It concedes only 1 point on base top-3 (dense's single strongest cell). `0.2` tied on robustness but lost on top-3 precision and the weak filename handle, so `0.4` was shipped. **M7 → RESOLVED.**
 
 **Still open after R1:** M8 (code-vs-docs burial) and M9 (filename-handle collisions) are *content-type / tokenization* problems, not fusion-weight problems — weighting lifted overall robustness (one previously-failing query recovered: fully-robust 9→10) but does not by itself rerank an impl file above a keyword-matching doc. Those need a separate mechanism (magnet-doc suppression / type-aware boosting / sub-word `C++`/`C#` tokenization) and remain future work.
+
+### Remediation R2 (2026-06-24) — filename/path-coverage boost (fixes M8 + M9)
+
+**Root cause of M8/M9:** retrieval scored only *chunk content*. A file literally named after the query concept (`incremental_indexer.py`, `hybrid_retriever.py`) carries that signal in its **path**, which the dense+sparse channels never see. So a conceptual doc that merely *discusses* the concept (e.g. `merkle-tree-drift-handling.md`) out-scored the impl file that *is* the concept. M9 (bare-filename lookups) is the same blind spot in the limit.
+
+**Fix (`search.rs`):** add a bounded, additive **path-coverage boost** to the fused score. The query is tokenized; the candidate file's *stem* is tokenized; coverage = fraction of stem tokens matched (with light shared-prefix-≥5 stemming so `indexer`/`indexing`, `retriever`/`retrieval` fold together). The boost is `PATH_BOOST_WEIGHT/(k+1) · coverage`, scaling a full filename match to one rank-1 RRF channel. `PATH_BOOST_WEIGHT=1.5` (env-overridable). It is additive and capped by coverage, so it *re-ranks* a name-matched file upward without letting any single token dominate.
+
+**Ordering bug found & fixed (this is what made the boost safe).** The boost initially collapsed result sets — query `incremental indexing merkle tree drift detection` returned only **3** results instead of 10. Cause: `rrf_fuse` truncated to `top_k` **before** `post_process` applied the per-file cap. The boost gave every chunk of one well-named doc the same coverage, so those chunks flooded the pre-truncation head; truncate-to-10 kept ~10 of them, then the per-file cap (max 3) deleted all but 3. Fix: `rrf_fuse` now returns the **full ranked candidate set**, and `hybrid_search` does **cap-then-truncate** (`post_process` → `truncate(top_k)`). This is a latent correctness fix independent of the boost: any flooding file would previously shrink the result set below `top_k`.
+
+**Validated by sweep** (`scratchpad/sweep_path.py`, RRF weights held at the R1 optimum 1.0/0.4, full 16×7 suite vs the 1,618-file union corpus):
+
+| PATH_BOOST_WEIGHT | mean robustness | fully-robust |
+| --- | --- | --- |
+| 0.0 (R1 baseline) | 3.94 | 10/16 |
+| 1.0 | 4.56 | 11/16 |
+| **1.5 (shipped)** | **4.69** | **12/16** |
+| 2.0 | 4.69 | 12/16 |
+| 3.0 | 4.62 | 11/16 |
+
+`1.5` and `2.0` tie on aggregate; `1.5` shipped as the more conservative boost (lower over-fit risk on unseen queries). The boost lifts robustness **broadly**, not just the two target queries — mean **3.94 → 4.69**, the best of every configuration measured (vs pure dense 3.88, old unweighted hybrid 3.69).
+
+**Per-query effect** (hybrid, union corpus, w=1.5):
+
+- **M8 `incremental indexing merkle tree drift detection`: 0/5 → 4/5.** `src/incremental_indexer.py` now surfaces at #4 (was dense-rank 22 / absent from hybrid top-60).
+- **M8 `hybrid retrieval dense sparse fusion`: 0/5 → 4/5.** `src/hybrid_retriever.py` now #1 (was #34).
+- **M9 filename variant:** `fname` per-variant top-3 **5/16 → 11/16**, top-10 14/16.
+
+The conceptual doc still co-occupies the head where it is genuinely relevant (merkle doc holds #1–3 on its query, capped at 3 by `post_process`) — the boost *adds* the impl file to the top-10 rather than evicting the doc. **M8 → RESOLVED. M9 → substantially improved** (filename top-3 recall more than doubled; remaining misses are bare single-token handles where the corpus holds near-duplicate copies across roots).
