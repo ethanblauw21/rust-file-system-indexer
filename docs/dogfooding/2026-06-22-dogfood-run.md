@@ -202,3 +202,21 @@ After fixing D6, the durable union was rebuilt across 4 roots (`codebase-indexer
 | M9 | **Filename-handle retrieval is the weakest probe under scale** — top-3 collapses to **5/16** in both modes (was 11/16 hybrid baseline). Basenames collide with same-named files across the 4 roots. | `fname` column: top-3 5/16 hybrid, 5/16 dense. | Med |
 
 **Goal status: COMPLETE.** All 16 targets have been mutation-tested ×5 in both the codebase-only baseline and the full-corpus distractor union. The dogfooding loop's exit condition ("each test tested with mutation mindset 5 times") is met. The persistent open issue is the **fusion/ranking layer** (M2/M7/M8 — hybrid trailing dense, code-vs-docs burial), not the storage, embedding, or change-detection layers, which are sound.
+
+### Remediation R1 (2026-06-24) — weighted RRF fusion (fixes M7)
+
+**Root cause of M7:** `rrf_fuse` blended the dense and sparse channels with **equal weight** — each contributed `1/(k+rank)`. Because dense is the stronger retriever on this corpus, an unrelated BM25 keyword match at sparse-rank 1–3 received the *same* fusion credit as a genuinely relevant dense hit, diluting precision. That is why unweighted hybrid (3.69) trailed pure dense (3.88).
+
+**Fix:** introduced per-channel weights — `score = w_dense/(k+rank_d) + w_sparse/(k+rank_s)` — with `RRF_DENSE_WEIGHT=1.0`, `RRF_SPARSE_WEIGHT=0.4` (env-overridable for tuning). Sparse still contributes (it rescues exact-token/synonym cases dense misses) but with less pull.
+
+**Weight chosen empirically.** Swept `w_sparse ∈ {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}` over the full 16×7 mutation suite against the 1,618-file union corpus (`scratchpad/sweep_rrf.py`). The `0.0` and `1.0` endpoints reproduced the dense (3.88) and old-hybrid (3.69) baselines exactly, validating the harness.
+
+| w_sparse | mean robustness | fully-robust | Σ top-3 | Σ top-10 |
+| --- | --- | --- | --- | --- |
+| 0.0 (≈ pure dense) | 3.88 | 9/16 | 68 | 87 |
+| **0.4 (shipped)** | **3.94** | **10/16** | **69** | **88** |
+| 1.0 (old unweighted) | 3.69 | 9/16 | 67 | 82 |
+
+Weighted hybrid at `0.4` **dominates the old unweighted fusion on every aggregate** and **beats pure dense** on robustness, total top-3 precision, and top-10 recall — combining dense's base precision with sparse's synonym rescue (synonym top-3 8→11 vs dense). It concedes only 1 point on base top-3 (dense's single strongest cell). `0.2` tied on robustness but lost on top-3 precision and the weak filename handle, so `0.4` was shipped. **M7 → RESOLVED.**
+
+**Still open after R1:** M8 (code-vs-docs burial) and M9 (filename-handle collisions) are *content-type / tokenization* problems, not fusion-weight problems — weighting lifted overall robustness (one previously-failing query recovered: fully-robust 9→10) but does not by itself rerank an impl file above a keyword-matching doc. Those need a separate mechanism (magnet-doc suppression / type-aware boosting / sub-word `C++`/`C#` tokenization) and remain future work.

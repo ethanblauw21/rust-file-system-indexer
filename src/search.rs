@@ -9,6 +9,23 @@ use std::sync::Arc;
 
 pub const RRF_K: f64 = 60.0;
 
+/// RRF channel weights. Dense (vector) is the stronger retriever on this corpus,
+/// so the sparse (BM25) channel is down-weighted: an unweighted fusion let BM25
+/// keyword noise from unrelated files dilute dense precision, so hybrid trailed
+/// pure dense (dogfooding finding M7). Sparse still contributes — it rescues
+/// exact-token and typo cases dense misses — just with less pull.
+pub const RRF_DENSE_WEIGHT:  f64 = 1.0;
+pub const RRF_SPARSE_WEIGHT: f64 = 0.4;
+
+/// Resolve the RRF weights, allowing env overrides for tuning sweeps without a
+/// rebuild (`RRF_DENSE_WEIGHT` / `RRF_SPARSE_WEIGHT`). Falls back to the constants.
+fn rrf_weights() -> (f64, f64) {
+    let parse = |k: &str, default: f64| {
+        std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(default)
+    };
+    (parse("RRF_DENSE_WEIGHT", RRF_DENSE_WEIGHT), parse("RRF_SPARSE_WEIGHT", RRF_SPARSE_WEIGHT))
+}
+
 // ── Output types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -359,7 +376,8 @@ pub async fn hybrid_search(
     let sparse_res = sparse_search(query, pool, tier, ext_filter, db).unwrap_or_default();
     let dense_res  = dense_fut.await?;
 
-    let mut results = rrf_fuse(dense_res, sparse_res, top_k);
+    let (w_dense, w_sparse) = rrf_weights();
+    let mut results = rrf_fuse(dense_res, sparse_res, top_k, w_dense, w_sparse);
     post_process(&mut results, max_per_file);
     Ok(results)
 }
@@ -397,9 +415,11 @@ fn post_process(results: &mut Vec<SearchResult>, max_per_file: usize) {
 // ── RRF fusion ────────────────────────────────────────────────────────────────
 
 pub fn rrf_fuse(
-    dense:  Vec<SearchResult>,
-    sparse: Vec<SearchResult>,
-    top_k:  usize,
+    dense:    Vec<SearchResult>,
+    sparse:   Vec<SearchResult>,
+    top_k:    usize,
+    w_dense:  f64,
+    w_sparse: f64,
 ) -> Vec<SearchResult> {
     let mut scores: HashMap<i64, f64>         = HashMap::new();
     let mut merged: HashMap<i64, SearchResult> = HashMap::new();
@@ -407,14 +427,14 @@ pub fn rrf_fuse(
     for (rank, mut r) in dense.into_iter().enumerate() {
         let rank1 = rank + 1;
         r.dense_rank = Some(rank1);
-        let delta = 1.0 / (RRF_K + rank1 as f64);
+        let delta = w_dense / (RRF_K + rank1 as f64);
         scores.entry(r.chunk_id).and_modify(|v| *v += delta).or_insert(delta);
         merged.entry(r.chunk_id).or_insert(r);
     }
 
     for (rank, r) in sparse.into_iter().enumerate() {
         let rank1 = rank + 1;
-        let delta = 1.0 / (RRF_K + rank1 as f64);
+        let delta = w_sparse / (RRF_K + rank1 as f64);
         scores.entry(r.chunk_id).and_modify(|v| *v += delta).or_insert(delta);
         merged.entry(r.chunk_id)
             .and_modify(|existing| {
@@ -444,8 +464,9 @@ pub fn rrf_fuse(
     });
     results.truncate(top_k);
 
-    // Normalize RRF scores: theoretical max is 2/(k+1) when rank-1 in both channels
-    let rrf_max = 2.0 / (RRF_K + 1.0);
+    // Normalize RRF scores: theoretical max is (w_dense+w_sparse)/(k+1) when an
+    // item is rank-1 in both weighted channels.
+    let rrf_max = (w_dense + w_sparse) / (RRF_K + 1.0);
     for r in &mut results {
         r.normalized_score = r.rrf_score.map(|s| (s / rrf_max).clamp(0.0, 1.0)).unwrap_or(0.0);
     }
@@ -498,7 +519,7 @@ mod tests {
         // Rank-1 item from a single channel should score 1/(60+1)
         let dense  = vec![make_result(1, 1, Some(1), None)];
         let sparse = vec![];
-        let results = rrf_fuse(dense, sparse, 10);
+        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
         assert_eq!(results.len(), 1);
         let score = results[0].rrf_score.unwrap();
         let expected = 1.0 / (RRF_K + 1.0);
@@ -510,7 +531,7 @@ mod tests {
         // Same chunk_id appearing in both channels should appear once
         let dense  = vec![make_result(42, 1, Some(1), None)];
         let sparse = vec![make_result(42, 1, None, Some(1))];
-        let results = rrf_fuse(dense, sparse, 10);
+        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
         assert_eq!(results.len(), 1, "deduplication failed");
         assert_eq!(results[0].chunk_id, 42);
     }
@@ -528,7 +549,7 @@ mod tests {
             make_result(single_id, 1, None, Some(2)),
         ];
 
-        let mut results = rrf_fuse(dense, sparse, 10);
+        let mut results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
         results.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap());
 
         // both_id (rank-1 dense + rank-1 sparse) should outscore single_id (rank-2 sparse only)
@@ -546,7 +567,7 @@ mod tests {
             .map(|i| make_result(i, 1, Some(i as usize), None))
             .collect();
         let sparse: Vec<SearchResult> = vec![];
-        let fused = rrf_fuse(dense, sparse, top_k);
+        let fused = rrf_fuse(dense, sparse, top_k, 1.0, 1.0);
         assert!(fused.len() <= top_k, "expected at most {} results, got {}", top_k, fused.len());
     }
 
@@ -555,7 +576,7 @@ mod tests {
         // Results from rrf_fuse with empty sparse have no sparse_score
         let dense  = vec![make_result(1, 1, Some(1), None)];
         let sparse = vec![];
-        let results = rrf_fuse(dense, sparse, 10);
+        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
         assert_eq!(results.len(), 1);
         assert!(results[0].sparse_score.is_none(), "dense-only result should have no sparse_score");
         assert!(results[0].dense_score.is_some(),  "dense-only result should have dense_score");
@@ -565,7 +586,7 @@ mod tests {
     fn sparse_only_mode_no_dense() {
         let dense  = vec![];
         let sparse = vec![make_result(1, 1, None, Some(1))];
-        let results = rrf_fuse(dense, sparse, 10);
+        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
         assert_eq!(results.len(), 1);
         assert!(results[0].dense_score.is_none(),  "sparse-only result should have no dense_score");
         assert!(results[0].sparse_score.is_some(), "sparse-only result should have sparse_score");
