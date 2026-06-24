@@ -9,21 +9,40 @@ use std::sync::Arc;
 
 pub const RRF_K: f64 = 60.0;
 
-/// RRF channel weights. Dense (vector) is the stronger retriever on this corpus,
-/// so the sparse (BM25) channel is down-weighted: an unweighted fusion let BM25
+/// Fusion weights. Dense (vector) is the stronger retriever on this corpus, so
+/// the sparse (BM25) channel is down-weighted: an unweighted fusion let BM25
 /// keyword noise from unrelated files dilute dense precision, so hybrid trailed
 /// pure dense (dogfooding finding M7). Sparse still contributes — it rescues
 /// exact-token and typo cases dense misses — just with less pull.
 pub const RRF_DENSE_WEIGHT:  f64 = 1.0;
 pub const RRF_SPARSE_WEIGHT: f64 = 0.4;
+/// Weight for the filename/path-token match bonus. Content embedding alone buries
+/// impl files under prose docs that describe the same concept (finding M8), and
+/// misses literal basename lookups (M9). A file named after what the query asks
+/// for is a strong relevance signal, so we add a bounded bonus proportional to how
+/// much of the file's basename the query covers. Scaled to one rank-1 RRF channel.
+pub const PATH_BOOST_WEIGHT: f64 = 1.5;
 
-/// Resolve the RRF weights, allowing env overrides for tuning sweeps without a
-/// rebuild (`RRF_DENSE_WEIGHT` / `RRF_SPARSE_WEIGHT`). Falls back to the constants.
-fn rrf_weights() -> (f64, f64) {
-    let parse = |k: &str, default: f64| {
-        std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(default)
-    };
-    (parse("RRF_DENSE_WEIGHT", RRF_DENSE_WEIGHT), parse("RRF_SPARSE_WEIGHT", RRF_SPARSE_WEIGHT))
+#[derive(Debug, Clone, Copy)]
+pub struct FusionWeights {
+    pub dense:  f64,
+    pub sparse: f64,
+    pub path:   f64,
+}
+
+impl FusionWeights {
+    /// Resolve weights, allowing env overrides for tuning sweeps without a rebuild
+    /// (`RRF_DENSE_WEIGHT` / `RRF_SPARSE_WEIGHT` / `PATH_BOOST_WEIGHT`).
+    fn resolve() -> Self {
+        let parse = |k: &str, default: f64| {
+            std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(default)
+        };
+        Self {
+            dense:  parse("RRF_DENSE_WEIGHT",  RRF_DENSE_WEIGHT),
+            sparse: parse("RRF_SPARSE_WEIGHT", RRF_SPARSE_WEIGHT),
+            path:   parse("PATH_BOOST_WEIGHT", PATH_BOOST_WEIGHT),
+        }
+    }
 }
 
 // ── Output types ──────────────────────────────────────────────────────────────
@@ -219,6 +238,52 @@ fn matches_ext(file_uri: &str, ext_filter: Option<&str>) -> bool {
     }
 }
 
+// ── Filename / path-token boost (M8 code-vs-docs, M9 filename handles) ─────────
+
+/// Split a string into lowercase alphanumeric tokens of length ≥ 3. Short tokens
+/// ("py", "md", "of", "a") are dropped as noise so file extensions and stop-words
+/// don't contribute to filename matching.
+fn tokenize(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// Light stem match: equal, or a shared leading prefix of ≥ 5 chars (both tokens
+/// ≥ 5 long). This folds `indexer`/`indexing` and `retriever`/`retrieval` together
+/// without a full stemmer, while staying tight enough to avoid spurious matches.
+fn token_matches(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.len() < 5 || b.len() < 5 {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count() >= 5
+}
+
+/// Fraction of a file's basename tokens that the query covers, in [0.0, 1.0].
+/// A file named after exactly what the query asks for (e.g. `incremental_indexer.py`
+/// for "incremental indexing …") scores ~1.0; an unrelated name scores 0.0. Using
+/// the *basename's* coverage (not the query's) keeps long queries from diluting a
+/// short, on-point filename.
+fn path_coverage(file_uri: &str, query_tokens: &[String]) -> f64 {
+    let stem = Path::new(file_uri)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let file_tokens = tokenize(&stem);
+    if file_tokens.is_empty() {
+        return 0.0;
+    }
+    let matched = file_tokens
+        .iter()
+        .filter(|ft| query_tokens.iter().any(|qt| token_matches(ft, qt)))
+        .count();
+    matched as f64 / file_tokens.len() as f64
+}
+
 // ── Dense search ──────────────────────────────────────────────────────────────
 
 pub async fn dense_search(
@@ -376,9 +441,14 @@ pub async fn hybrid_search(
     let sparse_res = sparse_search(query, pool, tier, ext_filter, db).unwrap_or_default();
     let dense_res  = dense_fut.await?;
 
-    let (w_dense, w_sparse) = rrf_weights();
-    let mut results = rrf_fuse(dense_res, sparse_res, top_k, w_dense, w_sparse);
+    // Fuse the full candidate pool, then cap-per-file, *then* truncate to top_k.
+    // Capping before truncation is essential: a single file whose chunks flood the
+    // fused head (e.g. a path-boosted doc) would otherwise fill the top_k slots and
+    // be cut down by the per-file cap afterwards, yielding far fewer than top_k
+    // results and burying well-ranked candidates from other files.
+    let mut results = rrf_fuse(dense_res, sparse_res, query, FusionWeights::resolve());
     post_process(&mut results, max_per_file);
+    results.truncate(top_k);
     Ok(results)
 }
 
@@ -414,13 +484,17 @@ fn post_process(results: &mut Vec<SearchResult>, max_per_file: usize) {
 
 // ── RRF fusion ────────────────────────────────────────────────────────────────
 
+/// Fuse the dense and sparse candidate lists with weighted RRF plus a filename
+/// boost, returning **all** merged candidates sorted by descending score. The
+/// caller is responsible for per-file capping and truncating to its `top_k` — see
+/// `hybrid_search` for why capping must precede truncation.
 pub fn rrf_fuse(
-    dense:    Vec<SearchResult>,
-    sparse:   Vec<SearchResult>,
-    top_k:    usize,
-    w_dense:  f64,
-    w_sparse: f64,
+    dense:   Vec<SearchResult>,
+    sparse:  Vec<SearchResult>,
+    query:   &str,
+    weights: FusionWeights,
 ) -> Vec<SearchResult> {
+    let FusionWeights { dense: w_dense, sparse: w_sparse, path: w_path } = weights;
     let mut scores: HashMap<i64, f64>         = HashMap::new();
     let mut merged: HashMap<i64, SearchResult> = HashMap::new();
 
@@ -449,10 +523,21 @@ pub fn rrf_fuse(
             });
     }
 
-    // Apply accumulated RRF scores
+    // Apply accumulated RRF scores, plus a filename/path-token bonus so a file
+    // named after what the query asks for can climb out from under prose docs that
+    // merely describe the same concept (M8) and so literal basename lookups surface
+    // their file (M9). The bonus is scaled to one rank-1 RRF channel — a full
+    // basename match is worth as much as topping a single retriever — and added
+    // *before* truncation so a buried-but-well-named candidate can rise into top_k.
+    let query_tokens = tokenize(query);
+    let path_unit = w_path / (RRF_K + 1.0);
     for (cid, score) in &scores {
         if let Some(r) = merged.get_mut(cid) {
-            r.rrf_score = Some(*score);
+            let mut total = *score;
+            if w_path > 0.0 && !query_tokens.is_empty() {
+                total += path_unit * path_coverage(&r.chunk.file_uri, &query_tokens);
+            }
+            r.rrf_score = Some(total);
         }
     }
 
@@ -462,11 +547,10 @@ pub fn rrf_fuse(
             .partial_cmp(&a.rrf_score.unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    results.truncate(top_k);
 
-    // Normalize RRF scores: theoretical max is (w_dense+w_sparse)/(k+1) when an
-    // item is rank-1 in both weighted channels.
-    let rrf_max = (w_dense + w_sparse) / (RRF_K + 1.0);
+    // Normalize: theoretical max is rank-1 in both weighted channels plus a full
+    // filename match — (w_dense + w_sparse + w_path) / (k+1).
+    let rrf_max = (w_dense + w_sparse + w_path) / (RRF_K + 1.0);
     for r in &mut results {
         r.normalized_score = r.rrf_score.map(|s| (s / rrf_max).clamp(0.0, 1.0)).unwrap_or(0.0);
     }
@@ -515,11 +599,56 @@ mod tests {
     }
 
     #[test]
+    fn path_coverage_matches_named_files() {
+        // A query whose terms name the file scores ~1.0 (light stem folds
+        // indexing→indexer, retrieval→retriever); an unrelated query scores 0.0.
+        let q = tokenize("incremental indexing merkle tree drift detection");
+        let cov = path_coverage("C:\\x\\src\\incremental_indexer.py", &q);
+        assert!(cov >= 0.99, "named impl file should be fully covered, got {cov}");
+
+        let q2 = tokenize("hybrid retrieval dense sparse fusion");
+        assert!(path_coverage("C:\\x\\src\\hybrid_retriever.py", &q2) >= 0.99);
+
+        // Literal basename lookup (M9) fully covers the file.
+        let q3 = tokenize("incremental_indexer");
+        assert!(path_coverage("C:\\x\\src\\incremental_indexer.py", &q3) >= 0.99);
+
+        // Unrelated query gets no credit; extension alone never matches.
+        let q4 = tokenize("quarterly budget spreadsheet");
+        assert_eq!(path_coverage("C:\\x\\src\\incremental_indexer.py", &q4), 0.0);
+        assert_eq!(path_coverage("C:\\x\\notes.py", &tokenize("python script")), 0.0);
+    }
+
+    #[test]
+    fn token_matches_stems_lightly() {
+        assert!(token_matches("indexer", "indexing"));   // shared prefix ≥5
+        assert!(token_matches("retriever", "retrieval"));
+        assert!(token_matches("hybrid", "hybrid"));       // exact
+        assert!(!token_matches("index", "ledger"));       // unrelated
+        assert!(!token_matches("cat", "car"));            // too short to fuzzy-match
+    }
+
+    #[test]
+    fn path_boost_lifts_named_file_over_doc() {
+        // A code file buried at dense-rank 5 whose name matches the query should
+        // overtake a higher-ranked doc that only matches semantically, once the
+        // path boost is applied.
+        let mut doc  = make_result(1, 1, Some(1), None);       // rank-1 doc, no name match
+        doc.chunk.file_uri = "C:\\x\\docs\\merkle-drift-notes.md".to_string();
+        let mut code = make_result(2, 1, Some(5), None);       // rank-5 code, name matches
+        code.chunk.file_uri = "C:\\x\\src\\incremental_indexer.py".to_string();
+
+        let weights = FusionWeights { dense: 1.0, sparse: 0.4, path: 1.5 };
+        let results = rrf_fuse(vec![doc, code], vec![], "incremental indexer drift", weights);
+        assert_eq!(results[0].chunk_id, 2, "name-matching code file should rank first");
+    }
+
+    #[test]
     fn rrf_k_smoothing() {
         // Rank-1 item from a single channel should score 1/(60+1)
         let dense  = vec![make_result(1, 1, Some(1), None)];
         let sparse = vec![];
-        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
+        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
         assert_eq!(results.len(), 1);
         let score = results[0].rrf_score.unwrap();
         let expected = 1.0 / (RRF_K + 1.0);
@@ -531,7 +660,7 @@ mod tests {
         // Same chunk_id appearing in both channels should appear once
         let dense  = vec![make_result(42, 1, Some(1), None)];
         let sparse = vec![make_result(42, 1, None, Some(1))];
-        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
+        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
         assert_eq!(results.len(), 1, "deduplication failed");
         assert_eq!(results[0].chunk_id, 42);
     }
@@ -549,7 +678,7 @@ mod tests {
             make_result(single_id, 1, None, Some(2)),
         ];
 
-        let mut results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
+        let mut results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
         results.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap());
 
         // both_id (rank-1 dense + rank-1 sparse) should outscore single_id (rank-2 sparse only)
@@ -559,16 +688,23 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_search_returns_top_k() {
-        // Build a list of N results and verify truncation to top_k
+    fn rrf_fuse_returns_sorted_candidates() {
+        // rrf_fuse now returns ALL fused candidates, sorted by descending score;
+        // truncation to top_k is the caller's job (post-cap). Verify both.
         let n     = 20usize;
         let top_k = 5usize;
         let dense: Vec<SearchResult> = (1..=n as i64)
             .map(|i| make_result(i, 1, Some(i as usize), None))
             .collect();
         let sparse: Vec<SearchResult> = vec![];
-        let fused = rrf_fuse(dense, sparse, top_k, 1.0, 1.0);
-        assert!(fused.len() <= top_k, "expected at most {} results, got {}", top_k, fused.len());
+        let mut fused = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
+        assert_eq!(fused.len(), n, "rrf_fuse should return all candidates, not truncate");
+        let sorted = fused.windows(2).all(|w| w[0].rrf_score >= w[1].rrf_score);
+        assert!(sorted, "results must be sorted by descending score");
+        // Caller truncates to top_k.
+        fused.truncate(top_k);
+        assert_eq!(fused.len(), top_k);
+        assert_eq!(fused[0].chunk_id, 1, "best (dense rank-1) candidate should lead");
     }
 
     #[test]
@@ -576,7 +712,7 @@ mod tests {
         // Results from rrf_fuse with empty sparse have no sparse_score
         let dense  = vec![make_result(1, 1, Some(1), None)];
         let sparse = vec![];
-        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
+        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
         assert_eq!(results.len(), 1);
         assert!(results[0].sparse_score.is_none(), "dense-only result should have no sparse_score");
         assert!(results[0].dense_score.is_some(),  "dense-only result should have dense_score");
@@ -586,7 +722,7 @@ mod tests {
     fn sparse_only_mode_no_dense() {
         let dense  = vec![];
         let sparse = vec![make_result(1, 1, None, Some(1))];
-        let results = rrf_fuse(dense, sparse, 10, 1.0, 1.0);
+        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
         assert_eq!(results.len(), 1);
         assert!(results[0].dense_score.is_none(),  "sparse-only result should have no dense_score");
         assert!(results[0].sparse_score.is_some(), "sparse-only result should have sparse_score");
