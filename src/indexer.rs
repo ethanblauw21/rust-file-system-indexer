@@ -667,12 +667,26 @@ impl IncrementalIndexer {
 
         let phase1 = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
-            file_uris.par_iter().for_each(|uri| {
-                let info = stored_info_bg.get(uri.as_str());
-                let action = process_file_sync(
-                    storage_bg.as_ref(), &FileChunker::new(), &chunker_map_bg, uri, info,
-                );
-                let _ = tx.blocking_send(action);
+            // Run file I/O + chunking on a DEDICATED rayon pool, NOT the global one.
+            // When the bounded channel fills, these workers park inside
+            // `tx.blocking_send`. The consumer's embedding step tokenizes with
+            // `Tokenizer::encode_batch`, which fans out over the GLOBAL rayon pool.
+            // If the producer used that same global pool, every worker would be
+            // parked on `blocking_send` and `encode_batch` would wait forever for a
+            // free worker — a deadlock that strands the whole index (0 CPU) once the
+            // file count exceeds the channel capacity. An isolated pool keeps the
+            // global pool free for the tokenizer while preserving backpressure.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .build()
+                .expect("failed to build chunking thread pool");
+            pool.install(|| {
+                file_uris.par_iter().for_each(|uri| {
+                    let info = stored_info_bg.get(uri.as_str());
+                    let action = process_file_sync(
+                        storage_bg.as_ref(), &FileChunker::new(), &chunker_map_bg, uri, info,
+                    );
+                    let _ = tx.blocking_send(action);
+                });
             });
         });
 

@@ -352,7 +352,10 @@ pub async fn hybrid_search(
     // Use a deeper candidate pool for both channels so RRF has enough candidates to fuse
     let pool = candidate_pool.max(top_k);
     let dense_fut  = dense_search(query, pool, tier, ext_filter, vectors, db, embedder);
-    let sparse_res = sparse_search(query, pool, tier, ext_filter, db)?;
+    // Degrade gracefully: a sparse (FTS5) error or empty result must NOT discard the
+    // dense channel. Fall back to dense-only fusion instead of aborting the whole query
+    // (Defect 5 — `?` here previously zeroed out hybrid on any FTS5 syntax error).
+    let sparse_res = sparse_search(query, pool, tier, ext_filter, db).unwrap_or_default();
     let dense_res  = dense_fut.await?;
 
     let mut results = rrf_fuse(dense_res, sparse_res, top_k);
