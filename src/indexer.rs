@@ -33,7 +33,7 @@ const MIN_NLIST:            usize  = 4;
 
 /// IVF-PQ partition count heuristic: 4√N clamped to [MIN_NLIST, 1024].
 pub fn compute_nlist(n: usize) -> usize {
-    ((n as f64).sqrt() as usize * 4).max(MIN_NLIST).min(1024)
+    ((n as f64).sqrt() as usize * 4).clamp(MIN_NLIST, 1024)
 }
 
 // ── Stable ID (byte-for-byte identical to Python _stable_id) ─────────────────
@@ -258,7 +258,7 @@ impl LanceStore {
         let id_list: String = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
         let mut stream = self.table
             .query()
-            .only_if(&format!("id IN ({})", id_list))
+            .only_if(format!("id IN ({})", id_list))
             .execute()
             .await
             .map_err(|e| IndexerError::VectorStore(e.to_string()))?;
@@ -464,7 +464,6 @@ impl Embedder {
 
         let b = batch_size;
         let h = hidden_dim;
-        let pooled_flat = pooled_flat;
 
         // Slice to first EMBEDDING_DIM dims and L2-normalise (Matryoshka: re-normalise after slice).
         let slice_dim = EMBEDDING_DIM.min(h);
@@ -542,11 +541,10 @@ fn process_file_sync(
         Err(e) => { tracing::warn!("Skipping {}: {}", uri, e); return FileAction::Error; }
     };
 
-    if let Some(info) = info {
-        if info.modified_at == Some(meta.modified_at) && !info.has_unembedded {
+    if let Some(info) = info
+        && info.modified_at == Some(meta.modified_at) && !info.has_unembedded {
             return FileAction::Skip;
         }
-    }
 
     let bytes = match storage.get_file_bytes(uri) {
         Ok(b)  => b,
@@ -555,11 +553,10 @@ fn process_file_sync(
 
     let hash = md5_hex(&bytes);
 
-    if let Some(info) = info {
-        if hash == info.content_hash && !info.has_unembedded {
+    if let Some(info) = info
+        && hash == info.content_hash && !info.has_unembedded {
             return FileAction::Skip;
         }
-    }
 
     tracing::info!("Indexing: {}", uri);
     let (chunk_result, chunker_method) = match chunker.chunk(&bytes, &meta, map) {
@@ -654,6 +651,7 @@ impl IncrementalIndexer {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     pub async fn index_root(
         &self,
         root_uri:    &str,
@@ -749,7 +747,7 @@ impl IncrementalIndexer {
                 }
             }
 
-            if total >= 20 && (checked % 100 == 0 || checked == total) {
+            if total >= 20 && (checked.is_multiple_of(100) || checked == total) {
                 tracing::info!(
                     "Checked {}/{} (indexed={} skipped={} errors={})",
                     checked, total, stats.indexed, stats.skipped, stats.errors
@@ -773,9 +771,23 @@ impl IncrementalIndexer {
         }
 
         // Remove files no longer on disk, including their LanceDB vectors (issue: ghost vectors).
+        //
+        // Scope the prune to the root we just indexed. `list_all_file_uris` returns *every*
+        // file in the index, which may span several roots (the index dir can be shared across
+        // `index <root>` calls to build a union corpus). A file under a *different* root is still
+        // on disk — it is simply not in this root's `live_uris` — so pruning on `live_uris` alone
+        // would silently evict every other root. Only reconcile URIs under `root_uri`.
+        let root_prefix = {
+            let mut p = root_uri.to_string();
+            if !p.ends_with(std::path::MAIN_SEPARATOR) {
+                p.push(std::path::MAIN_SEPARATOR);
+            }
+            p
+        };
         let all_uris = self.db.list_all_file_uris()?;
         for uri in all_uris {
-            if !live_uris.contains(uri.as_str()) {
+            let under_this_root = uri == root_uri || uri.starts_with(&root_prefix);
+            if under_this_root && !live_uris.contains(uri.as_str()) {
                 if let Some(info) = stored_info.get(uri.as_str()) {
                     let old_lance_ids = self.db.get_lance_ids_for_file(info.file_id)?;
                     self.vectors.remove_ids(&old_lance_ids).await?;
@@ -932,7 +944,7 @@ impl IncrementalIndexer {
             // Synthetic metadata — never touches StorageClient. `name` is the
             // last URI segment for display; falls back to the whole URI.
             let name = record.uri
-                .rsplit(|c| c == '/' || c == '\\')
+                .rsplit(['/', '\\'])
                 .find(|s| !s.is_empty())
                 .unwrap_or(record.uri.as_str())
                 .to_string();
@@ -1010,7 +1022,7 @@ impl IncrementalIndexer {
             let end          = (i + EMBED_BATCH_SIZE).min(texts.len());
             let batch_owned: Vec<String> = texts[i..end].to_vec();
             let batch_n      = batch_owned.len();
-            tracing::info!("Embedding batch {}/{} ({} chunks)", i / EMBED_BATCH_SIZE + 1, (texts.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE, batch_n);
+            tracing::info!("Embedding batch {}/{} ({} chunks)", i / EMBED_BATCH_SIZE + 1, texts.len().div_ceil(EMBED_BATCH_SIZE), batch_n);
             let emb          = embedder.clone();
             let vecs         = tokio::task::spawn_blocking(move || {
                 let batch_refs: Vec<&str> = batch_owned.iter().map(String::as_str).collect();
