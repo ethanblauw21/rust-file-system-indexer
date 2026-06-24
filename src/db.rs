@@ -2,7 +2,6 @@ use crate::error::IndexerError;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
-use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -30,8 +29,10 @@ pub struct ChunkRow {
     pub meta: serde_json::Value,
     pub lance_id: Option<i64>,
     pub file_uri: String,
+    #[allow(dead_code)]
     pub mime_type: String,
     pub is_flagged: bool,
+    #[allow(dead_code)]
     pub chunker_method: Option<String>,
     pub structural_score: Option<f32>,
     pub coherence_score: Option<f32>,
@@ -261,12 +262,13 @@ impl EnterpriseDb {
             ] {
                 let _ = conn.execute_batch(ddl);
             }
-            // Remove any existing T3 entries from the FTS index (T3 are now excluded from FTS).
-            // Uses the FTS5 external-content delete protocol; no-op if they're already absent.
-            let _ = conn.execute_batch(
-                "INSERT INTO chunks_fts(chunks_fts, rowid, content) \
-                 SELECT 'delete', c.id, c.content FROM chunks c WHERE c.tier = 3",
-            );
+            // NOTE: A previous version issued an FTS5 external-content 'delete' for every
+            // tier-3 row on each open to "clean up" T3 entries. That was corrupting: the
+            // chunks_ai trigger only ever inserts tiers 1-2 into chunks_fts, so those T3
+            // rows were never in the FTS index. Per the FTS5 docs, issuing 'delete' with
+            // content that does not match an indexed row corrupts the index — which surfaced
+            // as "database disk image is malformed" on the next MATCH after any second open.
+            // The triggers already guarantee FTS holds only T1/T2, so no cleanup is needed.
             let _ = conn.execute_batch("PRAGMA optimize");
         }
 
@@ -937,30 +939,33 @@ impl EnterpriseDb {
     /// tokens when every token is a stop word (e.g. a single-word query "the").
     /// Double-quotes pass through so callers can use FTS5 phrase syntax.
     pub fn sanitize_fts_query(query: &str) -> String {
-        let sanitized: String = query
-            .chars()
-            .map(|c| if "():^*".contains(c) { ' ' } else { c })
+        // Wrap each whitespace token as a quoted FTS5 phrase. Quoting makes FTS5 treat the
+        // token literally and neutralizes EVERY operator character at once (+, -, #, :, ^,
+        // *, parentheses, …). The previous denylist (`():^*`) missed +/-/# and left tokens
+        // bare, so "C++", "C#", "tree-sitter" reached FTS5 as operators → `syntax error`
+        // → 0 sparse hits (Defect 4).
+        let all_tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.replace('"', "")) // strip embedded quotes so the wrap can't be escaped
+            .filter(|t| !t.is_empty())
             .collect();
-        // FTS5 requires balanced double-quotes; drop the last one if odd.
-        let sanitized = if sanitized.chars().filter(|&c| c == '"').count() % 2 != 0 {
-            let last = sanitized.rfind('"').unwrap();
-            let mut s = sanitized;
-            s.remove(last);
-            s
-        } else {
-            sanitized
-        };
-        let all_tokens: Vec<&str> = sanitized.split_whitespace().collect();
         if all_tokens.is_empty() {
             return "\"\"".to_string();
         }
-        let filtered: Vec<&str> = all_tokens
+        let filtered: Vec<&String> = all_tokens
             .iter()
-            .copied()
             .filter(|t| !Self::STOP_WORDS.contains(&t.to_lowercase().as_str()))
             .collect();
-        let tokens = if filtered.is_empty() { all_tokens } else { filtered };
-        tokens.join(" OR ")
+        let tokens: Vec<&String> = if filtered.is_empty() {
+            all_tokens.iter().collect()
+        } else {
+            filtered
+        };
+        tokens
+            .iter()
+            .map(|t| format!("\"{}\"", t))
+            .collect::<Vec<_>>()
+            .join(" OR ")
     }
 }
 
@@ -1182,17 +1187,21 @@ mod tests {
     #[test]
     fn fts_sanitize_rejects_special_chars() {
         let (db, _dir) = open_test_db();
-        // Must not panic or return an error on FTS5 operator characters
-        let result = db.fts_search("error: \"null\"", 10);
-        assert!(result.is_ok(), "fts_search panicked on special chars");
+        // Must not panic or return an error on ANY FTS5 operator characters — including
+        // +, #, -, :, parens and quotes (Defect 4: "C++"/"C#"/"tree-sitter" used to throw
+        // `fts5: syntax error`).
+        for q in ["error: \"null\"", "C++ tree-sitter adapter", "C# .NET", "a-b (c)^*"] {
+            assert!(db.fts_search(q, 10).is_ok(), "fts_search errored on {:?}", q);
+        }
 
-        let s = EnterpriseDb::sanitize_fts_query("error: \"null\"");
-        assert!(!s.contains(':'), "colon should be stripped");
-        // Double-quotes now pass through for FTS5 phrase search, but must be balanced
+        // Every token is wrapped as a quoted FTS5 phrase, so operator chars are neutralized
+        // (they ride inside the quotes) and the quotes stay balanced.
+        let s = EnterpriseDb::sanitize_fts_query("C++ error: \"null\"");
         let qcount = s.chars().filter(|&c| c == '"').count();
         assert_eq!(qcount % 2, 0, "quotes must be balanced for FTS5");
+        assert!(s.contains("\"C++\""), "tokens must be quoted phrases, got: {s}");
 
-        // Empty input after stripping → sentinel
-        assert_eq!(EnterpriseDb::sanitize_fts_query("()^*:\"\""), "\"\"");
+        // Whitespace-only / empty input → sentinel empty phrase
+        assert_eq!(EnterpriseDb::sanitize_fts_query("   "), "\"\"");
     }
 }

@@ -1,7 +1,6 @@
 use crate::chunker_map::ChunkerMap;
 use crate::error::IndexerError;
 use crate::storage::FileMetadata;
-use serde_json;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::OnceLock;
@@ -70,11 +69,10 @@ fn get_tokenizer() -> Option<&'static tokenizers::Tokenizer> {
 }
 
 pub fn count_tokens(text: &str) -> usize {
-    if let Some(tok) = get_tokenizer() {
-        if let Ok(enc) = tok.encode(text, false) {
+    if let Some(tok) = get_tokenizer()
+        && let Ok(enc) = tok.encode(text, false) {
             return enc.len().max(1);
         }
-    }
     // Fallback: 3 UTF-8 bytes ≈ 1 token
     (text.len() / 3).max(1)
 }
@@ -83,8 +81,8 @@ pub fn split_to_budget(text: &str, budget: usize) -> Vec<String> {
     if text.trim().is_empty() {
         return vec![];
     }
-    if let Some(tok) = get_tokenizer() {
-        if let Ok(enc) = tok.encode(text, false) {
+    if let Some(tok) = get_tokenizer()
+        && let Ok(enc) = tok.encode(text, false) {
             let ids = enc.get_ids();
             if ids.len() <= budget {
                 // Fits in one chunk — return original text, no decode round-trip
@@ -111,7 +109,6 @@ pub fn split_to_budget(text: &str, budget: usize) -> Vec<String> {
                 return result;
             }
         }
-    }
     // Byte-length fallback: split at UTF-8 char boundaries
     let byte_budget = budget * 3;
     let mut result: Vec<String> = Vec::new();
@@ -146,7 +143,7 @@ fn row_to_kv(headers: &[String], values: &[String]) -> String {
 
 /// Strip YAML frontmatter (`---\n…\n---`) from the start of `text`.
 /// Returns `(key→value map, remaining body)`.
-pub fn extract_frontmatter<'a>(text: &'a str) -> (HashMap<String, String>, &'a str) {
+pub fn extract_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
     if !text.starts_with("---") {
         return (HashMap::new(), text);
     }
@@ -163,7 +160,7 @@ pub fn extract_frontmatter<'a>(text: &'a str) -> (HashMap<String, String>, &'a s
     let fm_text  = &after_open[..end];
     let after    = &after_open[end + close.len()..];
     // Skip optional \r\n after the closing ---
-    let after = after.trim_start_matches(|c| c == '\r' || c == '\n');
+    let after = after.trim_start_matches(['\r', '\n']);
 
     let mut fm = HashMap::new();
     for line in fm_text.lines() {
@@ -186,11 +183,10 @@ pub fn split_markdown_at_headings(text: &str) -> Vec<String> {
     // Collect byte offsets of H1-H3 headings using the offset iterator
     let mut heading_starts: Vec<usize> = Vec::new();
     for (event, range) in Parser::new_ext(text, Options::empty()).into_offset_iter() {
-        if let Event::Start(Tag::Heading { level, .. }) = event {
-            if (level as u32) <= 3 {
+        if let Event::Start(Tag::Heading { level, .. }) = event
+            && (level as u32) <= 3 {
                 heading_starts.push(range.start);
             }
-        }
     }
 
     if heading_starts.is_empty() {
@@ -226,7 +222,7 @@ pub fn split_markdown_at_headings(text: &str) -> Vec<String> {
     for section in raw {
         let is_heading_only = {
             let mut lines = section.lines();
-            lines.next().map(|l| is_heading_line(l)).unwrap_or(false) && lines.next().is_none()
+            lines.next().map(is_heading_line).unwrap_or(false) && lines.next().is_none()
         };
         if is_heading_only {
             if pending.is_empty() {
@@ -252,7 +248,7 @@ pub fn split_markdown_at_headings(text: &str) -> Vec<String> {
 fn is_heading_line(line: &str) -> bool {
     let t = line.trim_start();
     let n = t.chars().take_while(|&c| c == '#').count();
-    n >= 1 && n <= 6 && t.chars().nth(n) == Some(' ')
+    (1..=6).contains(&n) && t.chars().nth(n) == Some(' ')
 }
 
 /// Extract `[label](target)` links, resolving relative targets against `file_uri`.
@@ -512,8 +508,9 @@ fn parse_csv(data: &[u8], meta: &FileMetadata) -> Result<ChunkResult, IndexerErr
     let mut t2_tokens: usize       = 0;
     let mut row_count  = 0usize;
 
-    let mut records = rdr.records();
-    while let Some(result) = records.next() {
+    let records = rdr.records();
+    #[allow(clippy::explicit_counter_loop)]
+    for result in records {
         let record = result.map_err(|e| IndexerError::Parse {
             file:    meta.name.clone(),
             message: e.to_string(),
@@ -793,7 +790,7 @@ fn top_level_decl(line: &str) -> Option<(&'static str, String)> {
 /// Returns a shortened `end` that skips trailing blank lines in `lines[start..end]`.
 fn trim_blank_tail(lines: &[&str], start: usize, end: usize) -> usize {
     let mut e = end;
-    while e > start && lines.get(e - 1).map_or(false, |l| l.trim().is_empty()) {
+    while e > start && lines.get(e - 1).is_some_and(|l| l.trim().is_empty()) {
         e -= 1;
     }
     e

@@ -238,7 +238,7 @@ async fn dense_search_by_vec(
 
     let mut results: Vec<SearchResult> = chunk_map
         .into_values()
-        .filter(|c| tier.map_or(true, |t| c.tier == t))
+        .filter(|c| tier.is_none_or(|t| c.tier == t))
         .filter(|c| matches_ext(&c.file_uri, ext_filter))
         .map(|chunk| {
             let dense_score = chunk.lance_id.and_then(|lid| score_map.get(&lid).copied());
@@ -338,6 +338,7 @@ pub fn sparse_search(
 
 // ── Hybrid search (RRF) ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn hybrid_search(
     query:          &str,
     top_k:          usize,
@@ -352,7 +353,10 @@ pub async fn hybrid_search(
     // Use a deeper candidate pool for both channels so RRF has enough candidates to fuse
     let pool = candidate_pool.max(top_k);
     let dense_fut  = dense_search(query, pool, tier, ext_filter, vectors, db, embedder);
-    let sparse_res = sparse_search(query, pool, tier, ext_filter, db)?;
+    // Degrade gracefully: a sparse (FTS5) error or empty result must NOT discard the
+    // dense channel. Fall back to dense-only fusion instead of aborting the whole query
+    // (Defect 5 — `?` here previously zeroed out hybrid on any FTS5 syntax error).
+    let sparse_res = sparse_search(query, pool, tier, ext_filter, db).unwrap_or_default();
     let dense_res  = dense_fut.await?;
 
     let mut results = rrf_fuse(dense_res, sparse_res, top_k);

@@ -125,6 +125,16 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Push pre-fetched records into the index, reading NDJSON from stdin
+    /// (one JSON object per line: {uri, content, mime_type, modified_at?, meta?}).
+    Ingest {
+        /// Index storage directory
+        #[arg(long, default_value = ".fileSystem-index")]
+        index_dir: PathBuf,
+        /// Records per index_records call (also the IVF-PQ rebuild cadence)
+        #[arg(long, default_value_t = 128)]
+        batch: usize,
+    },
 }
 
 #[tokio::main]
@@ -165,6 +175,9 @@ async fn main() {
         }
         Command::Recheck { index_dir, dry_run } => {
             run_recheck(index_dir, dry_run).await;
+        }
+        Command::Ingest { index_dir, batch } => {
+            run_ingest(index_dir, batch).await;
         }
     }
 }
@@ -222,6 +235,107 @@ async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Ve
         }
         Err(e) => eprintln!("Indexing error: {}", e),
     }
+}
+
+/// Wire DTO for the `ingest` subcommand. `content` is a UTF-8 string on the wire
+/// (these payloads are `text/*` — diffs, configs, rendered text); it decodes into
+/// the `Vec<u8>` the in-memory `IngestRecord` holds. `meta` defaults to `{}` and
+/// `modified_at` is optional (the indexer defaults it to now).
+#[derive(serde::Deserialize)]
+struct IngestLine {
+    uri:         String,
+    content:     String,
+    mime_type:   String,
+    #[serde(default)]
+    modified_at: Option<f64>,
+    #[serde(default)]
+    meta:        serde_json::Value,
+}
+
+impl From<IngestLine> for crate::indexer::IngestRecord {
+    fn from(l: IngestLine) -> Self {
+        crate::indexer::IngestRecord {
+            uri:         l.uri,
+            content:     l.content.into_bytes(),
+            mime_type:   l.mime_type,
+            modified_at: l.modified_at,
+            meta:        l.meta,
+        }
+    }
+}
+
+async fn run_ingest(index_dir: PathBuf, batch: usize) {
+    use crate::indexer::{IncrementalIndexer, IngestRecord, Stats};
+    use crate::storage::LocalStorageClient;
+    use std::io::BufRead;
+    use std::sync::Arc;
+
+    let batch = batch.max(1);
+
+    // The push path never reads storage, but the constructor requires a backend.
+    let storage = Arc::new(LocalStorageClient::with_extra_ignores(Vec::new()));
+    let indexer = match IncrementalIndexer::new(storage, &index_dir).await {
+        Ok(i)  => i,
+        Err(e) => { eprintln!("Error creating indexer: {}", e); return; }
+    };
+
+    let t0 = std::time::Instant::now();
+    let mut totals    = Stats::default();
+    let mut malformed = 0usize;
+    let mut line_no   = 0usize;
+    let mut pending: Vec<IngestRecord> = Vec::with_capacity(batch);
+
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        line_no += 1;
+        let line = match line {
+            Ok(l)  => l,
+            Err(e) => { eprintln!("stdin read error at line {}: {}", line_no, e); break; }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Malformed-line policy: skip-and-count, so one bad line never aborts a
+        // long stream. The count is reported in the final summary.
+        match serde_json::from_str::<IngestLine>(&line) {
+            Ok(rec) => pending.push(rec.into()),
+            Err(e)  => {
+                malformed += 1;
+                tracing::warn!("Skipping malformed NDJSON at line {}: {}", line_no, e);
+                continue;
+            }
+        }
+        if pending.len() >= batch {
+            match indexer.index_records(&pending).await {
+                Ok(s) => {
+                    totals.indexed  += s.indexed;
+                    totals.errors   += s.errors;
+                    totals.vec_total = s.vec_total;
+                    pending.clear();
+                }
+                Err(e) => { eprintln!("Ingest error: {}", e); return; }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        match indexer.index_records(&pending).await {
+            Ok(s) => {
+                totals.indexed  += s.indexed;
+                totals.errors   += s.errors;
+                totals.vec_total = s.vec_total;
+            }
+            Err(e) => { eprintln!("Ingest error: {}", e); return; }
+        }
+    }
+
+    println!(
+        "Ingested in {}  —  {} records, {} chunker-errors, {} malformed lines skipped",
+        format_elapsed(t0.elapsed()),
+        fmt_num(totals.indexed  as i64),
+        fmt_num(totals.errors   as i64),
+        fmt_num(malformed       as i64),
+    );
+    println!("  {} vectors in index", fmt_num(totals.vec_total as i64));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -397,8 +511,8 @@ fn print_table(
     }
 
     println!(
-        "  {:>3}  {:>6}  {:>4}  {:<40}  {}",
-        "#", "Score", "Tier", "Source", "Preview"
+        "  {:>3}  {:>6}  {:>4}  {:<40}  Preview",
+        "#", "Score", "Tier", "Source"
     );
     println!("  {}", "─".repeat(96));
 
@@ -674,8 +788,8 @@ async fn run_scores_show(
     );
 
     println!(
-        "  {:>4}  {:>5}  {:>5}  {:>1}  {:<4}  {:<40}  {}",
-        "#", "str", "coh", "F", "Tier", "Source", "Preview"
+        "  {:>4}  {:>5}  {:>5}  {:>1}  {:<4}  {:<40}  Preview",
+        "#", "str", "coh", "F", "Tier", "Source"
     );
     println!("  {}", "─".repeat(100));
 
@@ -774,7 +888,7 @@ async fn run_recheck(index_dir: PathBuf, dry_run: bool) {
 
     // Tally drift counts by (old → new) for the report.
     let mut drift_counts: HashMap<(String, String), usize> = HashMap::new();
-    for (_, (old, new)) in &drift_map {
+    for (old, new) in drift_map.values() {
         *drift_counts.entry((old.clone(), new.clone())).or_insert(0) += 1;
     }
 
@@ -917,4 +1031,42 @@ fn format_unix_ts(ts: f64) -> String {
     let y   = if m <= 2 { y + 1 } else { y };
 
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hh, mm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingest_line_parses_and_converts_content_to_bytes() {
+        let line = r#"{"uri":"change://1/x","content":"diff --git a b","mime_type":"text/x-diff","modified_at":1700000000.0,"meta":{"tool":"edit"}}"#;
+        let parsed: IngestLine = serde_json::from_str(line).unwrap();
+        let rec: crate::indexer::IngestRecord = parsed.into();
+
+        assert_eq!(rec.uri, "change://1/x");
+        assert_eq!(rec.content, b"diff --git a b".to_vec(), "wire string decodes to UTF-8 bytes");
+        assert_eq!(rec.mime_type, "text/x-diff");
+        assert_eq!(rec.modified_at, Some(1_700_000_000.0));
+        assert_eq!(rec.meta["tool"], "edit");
+    }
+
+    #[test]
+    fn ingest_line_defaults_optional_fields() {
+        // modified_at and meta omitted — both default (meta -> Null, ts -> None).
+        let line = r#"{"uri":"u","content":"hello","mime_type":"text/plain"}"#;
+        let parsed: IngestLine = serde_json::from_str(line).unwrap();
+        assert!(parsed.meta.is_null(), "absent meta defaults to Null");
+        let rec: crate::indexer::IngestRecord = parsed.into();
+        assert!(rec.modified_at.is_none());
+    }
+
+    #[test]
+    fn ingest_line_malformed_is_rejected() {
+        // The subcommand's policy skips-and-counts on a deserialize Err; assert
+        // the parse layer that drives that policy fails on bad input.
+        assert!(serde_json::from_str::<IngestLine>(r#"{"uri":"u","mime_type":"text/plain"}"#).is_err(),
+            "missing required `content` must fail");
+        assert!(serde_json::from_str::<IngestLine>("not json at all").is_err(),
+            "non-JSON must fail");
+    }
 }
