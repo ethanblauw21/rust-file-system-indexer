@@ -242,12 +242,27 @@ fn matches_ext(file_uri: &str, ext_filter: Option<&str>) -> bool {
 
 /// Split a string into lowercase alphanumeric tokens of length ≥ 3. Short tokens
 /// ("py", "md", "of", "a") are dropped as noise so file extensions and stop-words
-/// don't contribute to filename matching.
+/// don't contribute to filename matching. Symbol-bearing language names are
+/// normalized first (see [`normalize_symbols`]) so `C++`/`C#` survive the split.
 fn tokenize(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_ascii_alphanumeric())
+    normalize_symbols(s)
+        .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_ascii_lowercase())
         .collect()
+}
+
+/// Map symbol-bearing language/tech names to stable alphanumeric tokens *before*
+/// the generic alnum splitter runs. Without this, `C++` and `C#` collapse to the
+/// 1-char token `c` (dropped by the ≥ 3 filter), so a query or filename about
+/// those languages can never earn a path-coverage boost. Because both the query
+/// and the file stem pass through here, the canonical forms always agree.
+fn normalize_symbols(s: &str) -> String {
+    s.to_ascii_lowercase()
+        .replace("c++", " cpp ")
+        .replace("c#", " csharp ")
+        .replace("f#", " fsharp ")
+        .replace(".net", " dotnet ")
 }
 
 /// Light stem match: equal, or a shared leading prefix of ≥ 5 chars (both tokens
@@ -617,6 +632,20 @@ mod tests {
         let q4 = tokenize("quarterly budget spreadsheet");
         assert_eq!(path_coverage("C:\\x\\src\\incremental_indexer.py", &q4), 0.0);
         assert_eq!(path_coverage("C:\\x\\notes.py", &tokenize("python script")), 0.0);
+    }
+
+    #[test]
+    fn symbol_languages_survive_tokenization() {
+        // `C++`/`C#`/`F#`/`.NET` would otherwise vanish (1-char `c` dropped).
+        assert_eq!(tokenize("C++"), vec!["cpp"]);
+        assert_eq!(tokenize("C#"), vec!["csharp"]);
+        assert_eq!(tokenize("F# parser"), vec!["fsharp", "parser"]);
+        assert_eq!(tokenize("ASP.NET core"), vec!["asp", "dotnet", "core"]);
+
+        // Query and filename normalize to the same canonical token, so a file
+        // named after the language earns full path coverage.
+        let q = tokenize("modern C++ memory model");
+        assert!(path_coverage("C:\\x\\src\\cpp_notes.md", &q) >= 0.49);
     }
 
     #[test]
