@@ -242,14 +242,59 @@ fn matches_ext(file_uri: &str, ext_filter: Option<&str>) -> bool {
 
 /// Split a string into lowercase alphanumeric tokens of length ≥ 3. Short tokens
 /// ("py", "md", "of", "a") are dropped as noise so file extensions and stop-words
-/// don't contribute to filename matching. Symbol-bearing language names are
-/// normalized first (see [`normalize_symbols`]) so `C++`/`C#` survive the split.
+/// don't contribute to filename matching. camelCase/PascalCase identifier stems
+/// are segmented into their component words first (see [`segment_identifier`]) so
+/// a basename like `RecFileSearch` yields `rec file search` instead of one opaque
+/// token, and symbol-bearing language names are normalized (see
+/// [`normalize_symbols`]) so `C++`/`C#` survive the split.
 fn tokenize(s: &str) -> Vec<String> {
-    normalize_symbols(s)
+    // Identifier segmentation is on by default; `PATH_SEGMENT_IDENTIFIERS=0`
+    // disables it for A/B sweeps without a rebuild (matches the env-tunable
+    // convention of the RRF/path weights above).
+    let prepared = if segment_identifiers_enabled() {
+        normalize_symbols(&segment_identifier(s))
+    } else {
+        normalize_symbols(s)
+    };
+    prepared
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_ascii_lowercase())
         .collect()
+}
+
+/// Whether camelCase/PascalCase stem segmentation is active. Defaults to `true`;
+/// set `PATH_SEGMENT_IDENTIFIERS=0` to disable (tuning/ablation only).
+fn segment_identifiers_enabled() -> bool {
+    !matches!(std::env::var("PATH_SEGMENT_IDENTIFIERS").as_deref(), Ok("0"))
+}
+
+/// Insert spaces at camelCase / PascalCase word boundaries so identifier-style
+/// file stems split into their component words. Without this, a PascalCase
+/// basename like `RecFileSearch` collapses to one opaque token that matches no
+/// natural-language query term, so name-handle files earn zero path coverage
+/// (finding M9). Two boundaries are inserted: lower-or-digit → upper (`fileSearch`
+/// → `file Search`) and the tail of an acronym run before a new word
+/// (`ASTChunker` → `AST Chunker`). Runs *before* [`normalize_symbols`] — and
+/// before any lowercasing — because the symbol tokens (`C++`/`C#`/`.NET`) carry
+/// no case boundaries, so this pass leaves them untouched for normalization.
+fn segment_identifier(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 8);
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 {
+            let prev = chars[i - 1];
+            let camel   = (prev.is_lowercase() || prev.is_ascii_digit()) && c.is_uppercase();
+            let acronym = prev.is_uppercase()
+                && c.is_uppercase()
+                && chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if camel || acronym {
+                out.push(' ');
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Map symbol-bearing language/tech names to stable alphanumeric tokens *before*
@@ -646,6 +691,26 @@ mod tests {
         // named after the language earns full path coverage.
         let q = tokenize("modern C++ memory model");
         assert!(path_coverage("C:\\x\\src\\cpp_notes.md", &q) >= 0.49);
+    }
+
+    #[test]
+    fn pascalcase_filenames_segment_into_words() {
+        // PascalCase / camelCase basenames split into their component words so a
+        // name-handle file matches natural-language query terms (finding M9).
+        assert_eq!(tokenize("RecFileSearch"),   vec!["rec", "file", "search"]);
+        assert_eq!(tokenize("ASTChunker"),      vec!["ast", "chunker"]);
+        assert_eq!(tokenize("hybridRetriever"), vec!["hybrid", "retriever"]);
+
+        // Symbol-language tokens carry no case boundary, so segmentation leaves
+        // them for normalize_symbols (regression guard for the C++/C#/.NET path).
+        assert_eq!(tokenize("C++"), vec!["cpp"]);
+        assert_eq!(tokenize("ASP.NET core"), vec!["asp", "dotnet", "core"]);
+
+        // The motivating case: the PascalCase handle now earns real path coverage
+        // (file + search match; "rec" is too short to fuzzy-match "recursive").
+        let q = tokenize("recursive file search walker");
+        let cov = path_coverage("C:\\x\\src\\RecFileSearch.py", &q);
+        assert!(cov >= 0.66, "PascalCase handle should cover ~2/3, got {cov}");
     }
 
     #[test]
