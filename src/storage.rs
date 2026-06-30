@@ -207,6 +207,14 @@ static IGNORED_DIRS: &[&str] = &[
     ".obsidian",
     // Windows system / user-profile noise
     "AppData", ".rustup", "google-cloud-sdk",
+    // Games / launchers — save & profile blobs, never user-authored content.
+    // Matching the whole folder also catches its `.cfg`/`.sii`/`.navcache`
+    // files that no extension list would (e.g. `Documents\American Truck
+    // Simulator\*`), which is the D7 leak we're closing here.
+    "Saved Games", "My Games",
+    "American Truck Simulator", "Euro Truck Simulator 2",
+    "Rockstar Games", "Telltale Games", "Paradox Interactive",
+    "Epic Games", "steamapps",
 ];
 
 /// File extensions to skip (binary / compiled / noisy content).
@@ -235,6 +243,10 @@ static IGNORED_EXTS: &[&str] = &[
     ".parquet",
     // Logs
     ".log",
+    // Game data / saves (engine blobs, not user content). The whole-folder
+    // denylist above catches most of these in situ; these handle strays that
+    // land outside a known game directory.
+    ".sii", ".navcache", ".scs", ".sav", ".save", ".vdf",
 ];
 
 // ── Cloud-placeholder detection (Windows / OneDrive) ─────────────────────────

@@ -141,7 +141,11 @@ pub async fn score_all(
         let s = structural_score(chunk);
         let c = coherence_score(chunk, db, lance).await;
 
-        let struct_bad = s < STRUCTURAL_THRESHOLD;
+        // `<=`, not `<`: chunks that fail token-count + sentence checks but pass
+        // bracket/whitespace/repetition score *exactly* 0.50 (import blocks,
+        // single-line `#pragma once`). An exclusive test let that dead-zone
+        // escape flagging; inclusive catches it without snaring the 0.55 cluster.
+        let struct_bad = s <= STRUCTURAL_THRESHOLD;
         let coher_bad  = c.is_some_and(|v| v < COHERENCE_THRESHOLD);
         let is_flagged = struct_bad || coher_bad;
 
