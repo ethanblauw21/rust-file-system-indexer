@@ -43,6 +43,7 @@ pub struct RawFusionConfig {
     pub dense_weight: Option<f64>,
     pub sparse_weight: Option<f64>,
     pub path_weight: Option<f64>,
+    pub trigram_weight: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

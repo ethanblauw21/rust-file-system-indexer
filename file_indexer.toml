@@ -81,6 +81,12 @@
 # lookups). Scaled to roughly one rank-1 RRF channel. Default: 1.5.
 # path_weight = 1.5
 
+# Weight of the OOV-scoped trigram fuzzy channel (typo/OOV recovery — see
+# search.rs `trigram_search`). Fires only on query tokens the porter/sparse
+# channel can't match, so it rides at a low weight; the validated win is flat
+# across [0.2, 0.5]. Env override: RRF_TRIGRAM_WEIGHT. Default: 0.3.
+# trigram_weight = 0.3
+
 [indexer]
 # Additional directory names to ignore at any depth, on top of the storage
 # layer's built-in ignore list (node_modules, .git, target, etc. — see
