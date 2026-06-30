@@ -163,11 +163,31 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
         tokenize      = 'porter unicode61'
     );
 
+-- Second sparse index over the same T1/T2 content, tokenized into overlapping
+-- 3-grams. The porter table above needs an exact (post-stem) token match, so a
+-- character transposition like "idnexer" never matches "indexer" and typo'd
+-- queries lose the sparse channel entirely. A typo'd word still shares most of
+-- its trigrams with the correct word, so trigram-overlap matching (decompose the
+-- token into trigrams, OR them — see `trigram_search_oov`) rescues it. This is a
+-- separate, lower-precision channel fused at a low RRF weight, not a replacement
+-- for the porter channel, and it fires only on tokens the porter index can't match
+-- (see `trigram_search_oov`). case_sensitive 0 folds case so queries and content
+-- agree regardless of casing.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_trigram
+    USING fts5(
+        content,
+        content       = 'chunks',
+        content_rowid = 'id',
+        tokenize      = "trigram case_sensitive 0"
+    );
+
 DROP TRIGGER IF EXISTS chunks_ai;
 CREATE TRIGGER chunks_ai
 AFTER INSERT ON chunks
 WHEN new.tier IN (1, 2) BEGIN
     INSERT INTO chunks_fts(rowid, content)
+    VALUES (new.id, new.content);
+    INSERT INTO chunks_trigram(rowid, content)
     VALUES (new.id, new.content);
 END;
 
@@ -177,7 +197,11 @@ AFTER UPDATE ON chunks
 WHEN old.tier IN (1, 2) OR new.tier IN (1, 2) BEGIN
     INSERT INTO chunks_fts(chunks_fts, rowid, content)
     VALUES ('delete', old.id, old.content);
+    INSERT INTO chunks_trigram(chunks_trigram, rowid, content)
+    VALUES ('delete', old.id, old.content);
     INSERT INTO chunks_fts(rowid, content)
+    SELECT new.id, new.content WHERE new.tier IN (1, 2);
+    INSERT INTO chunks_trigram(rowid, content)
     SELECT new.id, new.content WHERE new.tier IN (1, 2);
 END;
 
@@ -186,6 +210,8 @@ CREATE TRIGGER chunks_ad
 AFTER DELETE ON chunks
 WHEN old.tier IN (1, 2) BEGIN
     INSERT INTO chunks_fts(chunks_fts, rowid, content)
+    VALUES ('delete', old.id, old.content);
+    INSERT INTO chunks_trigram(chunks_trigram, rowid, content)
     VALUES ('delete', old.id, old.content);
 END;
 
@@ -269,6 +295,42 @@ impl EnterpriseDb {
             // content that does not match an indexed row corrupts the index — which surfaced
             // as "database disk image is malformed" on the next MATCH after any second open.
             // The triggers already guarantee FTS holds only T1/T2, so no cleanup is needed.
+
+            // One-time backfill of the trigram index for databases created before it
+            // existed: the sync triggers only fire on future inserts, so an index built by
+            // an older binary would have an empty chunks_trigram. Populate it from the
+            // already-stored T1/T2 chunk content (no re-index / re-embed needed).
+            //
+            // Emptiness can't be detected with `count(*)`: on an FTS5 external-content table
+            // a bare scan reads through to the content table, so `SELECT count(*) FROM
+            // chunks_trigram` returns the chunk count even when the index holds zero docs.
+            // Use PRAGMA user_version as a schema-migration marker instead — old binaries
+            // never set it, so it reads 0 for any pre-trigram DB.
+            let schema_version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            if schema_version < Self::TRIGRAM_SCHEMA_VERSION {
+                let has_chunks: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM chunks WHERE tier IN (1, 2))",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                if has_chunks {
+                    // delete-all first so an interrupted prior backfill can't leave dupes.
+                    let _ = conn.execute_batch(
+                        "INSERT INTO chunks_trigram(chunks_trigram) VALUES('delete-all');
+                         INSERT INTO chunks_trigram(rowid, content)
+                             SELECT id, content FROM chunks WHERE tier IN (1, 2);",
+                    );
+                }
+                let _ = conn.execute_batch(&format!(
+                    "PRAGMA user_version = {}",
+                    Self::TRIGRAM_SCHEMA_VERSION
+                ));
+            }
+
             let _ = conn.execute_batch("PRAGMA optimize");
         }
 
@@ -895,6 +957,132 @@ impl EnterpriseDb {
         Ok(results)
     }
 
+    /// Run an already-built trigram MATCH string against the trigram index.
+    fn run_trigram_match(
+        conn: &Connection,
+        match_query: &str,
+        limit: usize,
+    ) -> Result<Vec<FtsResult>, IndexerError> {
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.file_id, c.tier, c.content, c.meta,
+                    COALESCE(bm25(chunks_trigram), 0.0) AS bm25_score,
+                    f.file_uri
+             FROM   chunks_trigram
+             JOIN   chunks c ON chunks_trigram.rowid = c.id
+             JOIN   files  f ON c.file_id = f.id
+             WHERE  chunks_trigram MATCH ?1
+             ORDER  BY bm25_score
+             LIMIT  ?2",
+        )?;
+        let rows = stmt.query_map(params![match_query, limit as i64], |row| {
+            let meta_str: String = row.get(4)?;
+            Ok(FtsResult {
+                id:         row.get(0)?,
+                file_id:    row.get(1)?,
+                tier:       row.get::<_, i64>(2)? as u8,
+                content:    row.get(3)?,
+                meta: serde_json::from_str(&meta_str)
+                    .unwrap_or(serde_json::Value::Object(Default::default())),
+                bm25_score: row.get(5)?,
+                file_uri:   row.get(6)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Max trigrams folded into one MATCH query. A long natural-language query
+    /// produces many trigrams; capping keeps the SQL bounded and the channel from
+    /// degenerating into "match almost everything".
+    const MAX_TRIGRAMS: usize = 64;
+
+    /// PRAGMA user_version stamped once the trigram index is known to be present and
+    /// backfilled. Bump when a future migration must re-touch the trigram index.
+    const TRIGRAM_SCHEMA_VERSION: i64 = 1;
+
+    /// Minimum token length for the OOV trigram path. Below this a token yields one
+    /// or two trigrams that are far too generic ("ind", "ex") and match almost
+    /// everything, so short typo'd tokens are simply skipped.
+    const MIN_TRIGRAM_TOKEN_LEN: usize = 4;
+
+    /// Decompose the given tokens into deduped overlapping 3-grams OR-ed together.
+    /// Each trigram is wrapped as a quoted phrase so operator characters
+    /// (`+ # : ^ * (`) ride inside the quotes harmlessly — the same neutralisation
+    /// `sanitize_fts_query` relies on (Defect 4). Returns `None` if no token is long
+    /// enough to produce a trigram.
+    fn trigram_match_query_tokens(tokens: &[String]) -> Option<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut trigrams: Vec<String> = Vec::new();
+        'outer: for token in tokens {
+            let chars: Vec<char> = token.chars().collect();
+            if chars.len() < 3 {
+                continue;
+            }
+            for window in chars.windows(3) {
+                let tri: String = window.iter().collect();
+                if seen.insert(tri.clone()) {
+                    trigrams.push(tri);
+                    if trigrams.len() >= Self::MAX_TRIGRAMS {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if trigrams.is_empty() {
+            return None;
+        }
+        Some(
+            trigrams
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    }
+
+    /// Does the exact (porter) index contain a match for this single token? Used to
+    /// decide whether a query token is a genuine typo/OOV term worth routing to the
+    /// fuzzy trigram channel. Quoted so operator chars can't break the MATCH.
+    fn porter_has_term(conn: &Connection, token: &str) -> bool {
+        let q = format!("\"{}\"", token.replace('"', ""));
+        conn.query_row(
+            "SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ?1 LIMIT 1",
+            params![q],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Fuzzy search restricted to query tokens the porter channel can't match — the
+    /// genuine typo/OOV terms — using only those tokens' trigrams. Scoping this way
+    /// keeps the low-precision trigram channel silent on clean queries (where it only
+    /// added noise) and focuses it on the one failing token. Returns `[]` when every
+    /// token is already matched exactly (nothing to recover).
+    pub fn trigram_search_oov(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<FtsResult>, IndexerError> {
+        let conn = self.conn()?;
+        let oov: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.replace('"', "").to_lowercase())
+            .filter(|t| {
+                t.chars().count() >= Self::MIN_TRIGRAM_TOKEN_LEN
+                    && !Self::STOP_WORDS.contains(&t.as_str())
+            })
+            .filter(|t| !Self::porter_has_term(&conn, t))
+            .collect();
+        let match_query = match Self::trigram_match_query_tokens(&oov) {
+            Some(q) => q,
+            None => return Ok(vec![]),
+        };
+        Self::run_trigram_match(&conn, &match_query, limit)
+    }
+
     // ── Diagnostics ───────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<DbStats, IndexerError> {
@@ -1000,7 +1188,7 @@ mod tests {
             .collect();
 
         for expected in &[
-            "files", "chunks", "edges", "chunks_fts",
+            "files", "chunks", "edges", "chunks_fts", "chunks_trigram",
             "chunks_ai", "chunks_au", "chunks_ad",
         ] {
             assert!(
@@ -1182,6 +1370,96 @@ mod tests {
         assert_eq!(s.mime_counts[0].0, "text/markdown");
         assert_eq!(s.mime_counts[0].1, 2);
         assert_eq!(s.mime_counts[1].0, "text/plain");
+    }
+
+    #[test]
+    fn trigram_oov_fires_only_on_unmatched_tokens() {
+        let (db, _dir) = open_test_db();
+        let file_id = db
+            .upsert_file("file:///test/t.md", "text/markdown", "ht", 50, 1.0, None)
+            .unwrap();
+        db.insert_chunks(
+            file_id,
+            &[
+                ChunkInput {
+                    tier: 1, chunk_index: 0,
+                    content: "the incremental indexer rebuilds on drift".to_string(),
+                    token_count: None, meta: serde_json::json!({}), chunker_method: None,
+                },
+                ChunkInput {
+                    tier: 1, chunk_index: 1,
+                    content: "completely unrelated note about gardening".to_string(),
+                    token_count: None, meta: serde_json::json!({}), chunker_method: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        // Porter misses the transposition; the OOV fuzzy channel recovers it.
+        let typo = "idnexer"; // mutate.py transposition of "indexer"
+        assert!(db.fts_search(typo, 10).unwrap().is_empty(), "porter should miss the typo");
+        let hit = db.trigram_search_oov(typo, 10).unwrap();
+        assert!(
+            hit.iter().any(|r| r.content.contains("incremental indexer")),
+            "OOV path must recover a typo'd token, got {hit:?}"
+        );
+
+        // A query whose every token the porter index DOES match yields nothing — the
+        // fuzzy channel stays silent on clean queries (no noise to displace good hits).
+        assert!(
+            db.trigram_search_oov("incremental indexer", 10).unwrap().is_empty(),
+            "OOV path must be silent when every token matches exactly"
+        );
+        // A typo mixed with matched tokens still fires (only the typo's trigrams).
+        assert!(
+            !db.trigram_search_oov("incremental idnexer drift", 10).unwrap().is_empty(),
+            "OOV path must fire on the one unmatched token in an otherwise-clean query"
+        );
+
+        // Operator chars and all-short-token queries must not error / must no-op.
+        assert!(db.trigram_search_oov("C++ a", 10).is_ok());
+        assert!(
+            db.trigram_search_oov("a b", 10).unwrap().is_empty(),
+            "no token >= MIN_TRIGRAM_TOKEN_LEN -> empty"
+        );
+    }
+
+    #[test]
+    fn trigram_backfills_for_preexisting_db() {
+        // Simulate an index built by an older binary: insert chunks, then wipe the
+        // trigram index AND reset user_version to 0 (old binaries never stamped it), so
+        // reopen sees a pre-trigram schema and repopulates from stored chunk content.
+        //
+        // Emptiness is checked with MATCH, not count(*): on an external-content FTS5 table
+        // count(*) reads through to `chunks` and stays nonzero even with an empty index.
+        let dir  = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bf.db");
+        {
+            let db = EnterpriseDb::new(&path).unwrap();
+            let fid = db.upsert_file("file:///bf.md", "text/markdown", "h", 10, 1.0, None).unwrap();
+            db.insert_chunks(fid, &[ChunkInput {
+                tier: 1, chunk_index: 0, content: "incremental indexer drift".into(),
+                token_count: None, meta: serde_json::json!({}), chunker_method: None,
+            }]).unwrap();
+            // Emulate a DB created before the trigram index existed.
+            db.conn().unwrap()
+                .execute_batch(
+                    "INSERT INTO chunks_trigram(chunks_trigram) VALUES('delete-all');
+                     PRAGMA user_version = 0;",
+                )
+                .unwrap();
+            assert!(
+                db.trigram_search_oov("idnexer", 10).unwrap().is_empty(),
+                "trigram index should miss after delete-all (pre-backfill)"
+            );
+        }
+        // Reopen: backfill should repopulate from existing chunk content.
+        let db = EnterpriseDb::new(&path).unwrap();
+        assert!(
+            db.trigram_search_oov("idnexer", 10).unwrap()
+                .iter().any(|r| r.content.contains("incremental indexer")),
+            "reopen must backfill the trigram index and make it queryable"
+        );
     }
 
     #[test]
