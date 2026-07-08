@@ -1,0 +1,6 @@
+# Corpus roots are re-derivable from tools/corpus/manifest.toml (pinned SHAs) —
+# never commit the cloned source or the built union index.
+corpus/.cache/
+*.fileSystem-index-eval/
+__pycache__/
+*.pyc
