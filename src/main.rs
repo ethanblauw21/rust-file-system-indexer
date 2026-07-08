@@ -791,13 +791,13 @@ async fn run_score(index_dir: PathBuf, rescore: bool) {
         Err(e) => { eprintln!("Error opening index: {}", e); std::process::exit(1); }
     };
 
-    if let Ok(Some(mode)) = searcher.db.get_meta("embed_mode") {
-        if mode == "no_embed" {
-            println!(
-                "note: this index's recorded embed_mode is 'no_embed' — coherence scores will be \
-                 unavailable for every chunk (no lance_id), only structural scores apply."
-            );
-        }
+    if let Ok(Some(mode)) = searcher.db.get_meta("embed_mode")
+        && mode == "no_embed"
+    {
+        println!(
+            "note: this index's recorded embed_mode is 'no_embed' — coherence scores will be \
+             unavailable for every chunk (no lance_id), only structural scores apply."
+        );
     }
 
     match score_all(&searcher.db, &searcher.vectors, rescore, None).await {

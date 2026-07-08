@@ -297,14 +297,12 @@ impl App {
         if self.search_focused {
             // ── Search-bar focus: all chars type, Down moves cursor to results ──
             match key.code {
-                KeyCode::Esc => {
-                    if !self.query.is_empty() {
-                        self.query.clear();
-                        self.results.clear();
-                        self.selected = 0;
-                        self.list_offset = 0;
-                        self.debounce_deadline = None;
-                    }
+                KeyCode::Esc if !self.query.is_empty() => {
+                    self.query.clear();
+                    self.results.clear();
+                    self.selected = 0;
+                    self.list_offset = 0;
+                    self.debounce_deadline = None;
                 }
                 KeyCode::Enter => {
                     let cmd = self.query.trim().to_ascii_lowercase();
@@ -347,10 +345,8 @@ impl App {
                 KeyCode::Down if !self.results.is_empty() => {
                     self.search_focused = false;
                 }
-                KeyCode::Backspace => {
-                    if self.query.pop().is_some() {
-                        self.schedule_search();
-                    }
+                KeyCode::Backspace if self.query.pop().is_some() => {
+                    self.schedule_search();
                 }
                 KeyCode::Char(c) => {
                     self.query.push(c);
@@ -414,10 +410,8 @@ impl App {
                     }
                 }
 
-                KeyCode::Down => {
-                    if self.selected + 1 < self.results.len() {
-                        self.selected += 1;
-                    }
+                KeyCode::Down if self.selected + 1 < self.results.len() => {
+                    self.selected += 1;
                 }
 
                 KeyCode::Enter => {

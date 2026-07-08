@@ -354,9 +354,9 @@ impl LanceStore {
 
 /// Runs `f` on a dedicated thread and waits up to `timeout` for it to finish.
 /// A version-mismatched ONNX Runtime DLL can wedge indefinitely inside its own
-/// native `GetApi()` call instead of returning an error (see dogfood doc Defect
-/// 1) — we can't kill a stuck native call, but we CAN stop waiting on it and
-/// surface a loud timeout error to the caller instead of hanging the whole
+/// native `GetApi()` call instead of returning an error (see the dogfood doc's
+/// Defect 1) — we can't kill a stuck native call, but we CAN stop waiting on it
+/// and surface a loud timeout error to the caller instead of hanging the whole
 /// `index`/`search` command. The spawned thread is intentionally leaked on
 /// timeout; there is no safe way to cancel a blocked FFI call from Rust.
 fn run_with_timeout<T, F>(timeout: std::time::Duration, f: F) -> Result<T, IndexerError>

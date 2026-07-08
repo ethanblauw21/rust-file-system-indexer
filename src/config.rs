@@ -79,18 +79,18 @@ impl RawConfig {
     /// describing a different build than the one running — silently ignoring
     /// it would let the file lie about the corpus's actual vector width.
     pub fn validate_embedding_dim(&self, compiled_dim: usize) -> Result<(), IndexerError> {
-        if let Some(configured) = self.embedder.embedding_dim {
-            if configured != compiled_dim {
-                return Err(IndexerError::Config(format!(
+        if let Some(configured) = self.embedder.embedding_dim
+            && configured != compiled_dim
+        {
+            return Err(IndexerError::Config(format!(
                     "file_indexer.toml [embedder].embedding_dim = {} does not match this build's \
                      compiled EMBEDDING_DIM = {} (src/indexer.rs). These must agree — the compiled \
                      binary always uses EMBEDDING_DIM regardless of what the config file says, so a \
                      mismatch means the config is describing a different build than the one running. \
                      Fix embedding_dim in file_indexer.toml to {}, or rebuild the binary with \
                      EMBEDDING_DIM changed to match.",
-                    configured, compiled_dim, compiled_dim
-                )));
-            }
+                configured, compiled_dim, compiled_dim
+            )));
         }
         Ok(())
     }
