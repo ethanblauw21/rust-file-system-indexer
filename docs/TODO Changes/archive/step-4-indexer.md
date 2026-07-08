@@ -1,5 +1,18 @@
 # COMPLETED at 5/13/26
 
+> **Archive note (added 2026-07-08, doc-truth-auditor):** This is a pre-implementation planning
+> spec, kept as a historical record — its numbers are what was originally planned, not what
+> shipped, and are intentionally left unedited below. Three of its constants diverged from the
+> shipped implementation:
+> - `EMBEDDING_DIM = 768` (line 16 below) — shipped as **256** (Matryoshka-sliced), `src/indexer.rs:24`.
+> - `NLIST = 32` (line 20 below, fixed constant) — shipped as **dynamic**: `compute_nlist(n)`,
+>   `clamp(4√N, 4, 1024)`, `src/indexer.rs:43-45`.
+> - `EMBED_BATCH_SIZE = 256` (line 19 below) — shipped as **32**, `src/indexer.rs:28`.
+>
+> The canonical statement of the embedding dimension and its rationale lives in `CLAUDE.md`'s
+> "Key Design Decisions" section (`EMBEDDING_DIM` bullet); `nlist` sizing is documented in the
+> same section. Treat this file as history, not current fact.
+
 # Step 4 — Embedding & Vector DB (`indexer.rs`) ⏳
 
 **Status:** Pending
