@@ -43,6 +43,14 @@ enum Command {
         /// Override the configured/default embed batch size for this run.
         #[arg(long)]
         embed_batch_size: Option<usize>,
+        /// Measure and print cumulative per-stage timing (chunking, tokenize,
+        /// inference, sqlite writes, LanceDB writes, IVF build) after the run.
+        /// A Phase-0 measurement gate for ADR-006 (CUDA embedding EP) — see
+        /// docs/adr/ADR-006-cuda-embedding-execution-provider.md. Producer and
+        /// consumer stages overlap, so the printed totals are cumulative
+        /// time-in-stage, not a wall-clock partition.
+        #[arg(long)]
+        profile: bool,
     },
     /// Search the index
     Search {
@@ -159,8 +167,8 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Index { root, index_dir, reindex, exclude, no_embed, embed_batch_size } => {
-            run_index(root, index_dir, reindex, exclude, no_embed, embed_batch_size).await;
+        Command::Index { root, index_dir, reindex, exclude, no_embed, embed_batch_size, profile } => {
+            run_index(root, index_dir, reindex, exclude, no_embed, embed_batch_size, profile).await;
         }
         Command::Search {
             query, like, mode, top_k, candidate_pool, max_per_file,
@@ -192,8 +200,8 @@ async fn main() {
     }
 }
 
-async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Vec<String>, no_embed: bool, embed_batch_size: Option<usize>) {
-    use crate::indexer::{IncrementalIndexer, Stats};
+async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Vec<String>, no_embed: bool, embed_batch_size: Option<usize>, profile: bool) {
+    use crate::indexer::{IncrementalIndexer, Profile, Stats};
     use crate::storage::LocalStorageClient;
     use std::sync::Arc;
 
@@ -223,6 +231,10 @@ async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Ve
     };
     if let Some(n) = embed_batch_size {
         indexer.embed_batch_size = n;
+    }
+    let profiler = if profile { Some(Arc::new(Profile::new())) } else { None };
+    if let Some(p) = &profiler {
+        indexer = indexer.with_profile(p.clone());
     }
 
     let root_str_for_start = root_str.clone();
@@ -255,6 +267,15 @@ async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Ve
                 fmt_num(stats.errors  as i64),
             );
             println!("  {} vectors in index", fmt_num(stats.vec_total as i64));
+
+            if let Some(p) = &profiler {
+                // Under --no-embed no chunks go through the embedder, so `chunks
+                // embedded` would read zero and understate throughput; report the
+                // indexed-file count instead so chunks/sec still means something.
+                let total_units = if no_embed { stats.indexed } else { p.chunks_embedded() as usize };
+                println!();
+                println!("{}", p.render(t0.elapsed(), total_units));
+            }
         }
         Err(e) => { eprintln!("Indexing error: {}", e); std::process::exit(1); }
     }
