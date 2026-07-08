@@ -68,7 +68,7 @@ def path_matches(returned_file, target_rel_path):
     return a == b or a.endswith("/" + b)
 
 
-def append_baseline(record, path, key_fields=("mode", "weights", "corpus")):
+def append_baseline(record, path, key_fields=("label", "mode", "weights", "corpus")):
     """Append ``record`` to a JSONL baseline, replacing any row with the same key.
 
     Rewrites the file sorted by key so diffs stay stable and git-friendly. Returns

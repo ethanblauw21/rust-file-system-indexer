@@ -98,5 +98,9 @@ stays consistent when they are authored.
 | ADR | Title | Status |
 |-----|-------|--------|
 | [ADR-001](ADR-001-push-streamed-ingestion.md) | Push / Streamed Ingestion — a producer-driven ingress alongside the pull walker | Proposed |
+| ADR-002 | *(reserved — R1, weighted RRF fusion; not yet authored)* | — |
+| ADR-003 | *(reserved — R2, path-coverage boost; not yet authored)* | — |
+| [ADR-004](ADR-004-trigram-fuzzy-fts-no-ship.md) | OOV-Scoped Trigram Fuzzy FTS5 Channel — No-Ship | Accepted (no-ship verdict) |
+| [ADR-005](ADR-005-magnet-doc-suppression-skip.md) | Magnet-Doc Suppression — Diagnosed, Not Built (Skip) | Accepted (skip verdict) |
 
 Update this table whenever an ADR's file or status changes.
