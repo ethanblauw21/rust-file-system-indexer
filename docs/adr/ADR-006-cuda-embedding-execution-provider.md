@@ -69,9 +69,25 @@ profile decides.
 `codebase-indexer` @ pinned SHA (target) + 5 pinned distractor repos (`click`,
 `zustand`, `p-queue`, `serilog`, `spdlog`), ~1,126 files (`tools/corpus/manifest.toml`).
 
-**Phase-0 CPU baseline (git SHA `<pending>`):** _to be recorded — per-phase
-wall-clock (chunking / tokenize / inference / SQLite write / LanceDB write / IVF
-rebuild) + overall chunks/sec._
+**Phase-0 CPU baseline (git SHA `f399acc`, CPU EP, `EMBED_BATCH_SIZE=32`, `index --profile --reindex`, plugged into wall power):**
+
+905 indexable files → 9,911 vectors. Wall-clock **4613 s (1h 16m)**, **2.1 chunks/sec**.
+Cumulative time-in-stage (producer/consumer overlap, so stages need not sum to wall-clock):
+
+| stage | seconds | % of summed stage time |
+|---|---:|---:|
+| **inference** | **4506.0** | **97.0%** |
+| lance_write | 64.6 | 1.4% |
+| chunking | 37.1 | 0.8% |
+| tokenize | 27.5 | 0.6% |
+| ivf_build | 6.2 | 0.1% |
+| sqlite_write | 4.7 | 0.1% |
+| summed | 4646.2 | — |
+
+**Gate verdict: embedding dominates (inference = 97.0% of stage time, 97.7% of wall-clock).**
+The single `Mutex<Session>` consumer is serialized on inference; summed stage time (4646 s)
+≈ wall-clock (4613 s), so there is no producer/consumer overlap left to reclaim — the only
+phase worth attacking is inference. Phase 1 (CUDA EP) is justified. Proceeding.
 
 **CUDA path (git SHA `<pending>`, batch size `<pending>`, thermal steady state):**
 _to be recorded — same per-phase breakdown + chunks/sec._
@@ -106,7 +122,7 @@ the divergence from the ranking-ADR discipline is auditable, not accidental.
 
 > Updated during development. Record deviations, surprises, and in-the-moment decisions.
 
-- [ ] Phase 0 — add per-phase timing (`--profile`), measure CPU baseline on the corpus, git-SHA stamp. Confirm (or refute) embedding dominates.
+- [x] Phase 0 — added per-phase timing (`--profile`, commit `f399acc`); measured CPU baseline on the 974/905-file corpus. **Embedding confirmed dominant: inference = 97.0% of stage time.** Gate cleared.
 - [ ] Phase 1 — `cuda` Cargo feature + CUDA EP registration in `Embedder::load`; timeout still surfaces a named error; CPU/CUDA parity test (cosine ≈ 1.0).
 - [ ] Phase 2 — batch-size sweep on CUDA; set throughput-optimal value via existing config/CLI knob.
 - [ ] Phase 3 — re-profile CUDA path at steady state; report relocated bottleneck if any.
