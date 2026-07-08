@@ -102,5 +102,6 @@ stays consistent when they are authored.
 | ADR-003 | *(reserved — R2, path-coverage boost; not yet authored)* | — |
 | [ADR-004](ADR-004-trigram-fuzzy-fts-no-ship.md) | OOV-Scoped Trigram Fuzzy FTS5 Channel — No-Ship | Accepted (no-ship verdict) |
 | [ADR-005](ADR-005-magnet-doc-suppression-skip.md) | Magnet-Doc Suppression — Diagnosed, Not Built (Skip) | Accepted (skip verdict) |
+| [ADR-006](ADR-006-cuda-embedding-execution-provider.md) | CUDA Execution Provider for the Embedding Phase (opt-in, throughput-gated) | Proposed |
 
 Update this table whenever an ADR's file or status changes.
