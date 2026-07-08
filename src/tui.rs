@@ -297,14 +297,12 @@ impl App {
         if self.search_focused {
             // ── Search-bar focus: all chars type, Down moves cursor to results ──
             match key.code {
-                KeyCode::Esc => {
-                    if !self.query.is_empty() {
-                        self.query.clear();
-                        self.results.clear();
-                        self.selected = 0;
-                        self.list_offset = 0;
-                        self.debounce_deadline = None;
-                    }
+                KeyCode::Esc if !self.query.is_empty() => {
+                    self.query.clear();
+                    self.results.clear();
+                    self.selected = 0;
+                    self.list_offset = 0;
+                    self.debounce_deadline = None;
                 }
                 KeyCode::Enter => {
                     let cmd = self.query.trim().to_ascii_lowercase();
@@ -347,10 +345,8 @@ impl App {
                 KeyCode::Down if !self.results.is_empty() => {
                     self.search_focused = false;
                 }
-                KeyCode::Backspace => {
-                    if self.query.pop().is_some() {
-                        self.schedule_search();
-                    }
+                KeyCode::Backspace if self.query.pop().is_some() => {
+                    self.schedule_search();
                 }
                 KeyCode::Char(c) => {
                     self.query.push(c);
@@ -414,10 +410,8 @@ impl App {
                     }
                 }
 
-                KeyCode::Down => {
-                    if self.selected + 1 < self.results.len() {
-                        self.selected += 1;
-                    }
+                KeyCode::Down if self.selected + 1 < self.results.len() => {
+                    self.selected += 1;
                 }
 
                 KeyCode::Enter => {
@@ -600,7 +594,11 @@ impl App {
 
         tokio::spawn(async move {
             let storage = Arc::new(LocalStorageClient::new());
-            let indexer = match IncrementalIndexer::new(storage, &index_dir).await {
+            // force_recreate=false: the TUI's index trigger never destroys the vector
+            // table on a dim mismatch. no_embed=false: same default as `index` with no
+            // --no-embed — a missing/broken embedder surfaces as a loud error in the
+            // indexing log below rather than silently degrading to sparse-only.
+            let indexer = match IncrementalIndexer::new(storage, &index_dir, false).await {
                 Ok(i)  => i,
                 Err(e) => { let _ = tx.try_send(format!("Error: {e}")); return; }
             };
@@ -611,7 +609,7 @@ impl App {
                     checked, total, s.indexed, s.skipped, s.errors,
                 ));
             };
-            match indexer.index_root(&root_str, false, None, Some(&on_progress)).await {
+            match indexer.index_root(&root_str, false, false, None, Some(&on_progress)).await {
                 Ok(s)  => { let _ = tx.try_send(format!("Done — {} indexed, {} skipped, {} errors", s.indexed, s.skipped, s.errors)); }
                 Err(e) => { let _ = tx.try_send(format!("Error: {e}")); }
             }

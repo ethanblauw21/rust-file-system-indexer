@@ -1,5 +1,14 @@
 # COMPLETED at 5/13/26
 
+> **Archive note (added 2026-07-08, doc-truth-auditor):** This is a pre-implementation planning
+> spec, kept as a historical record — left unedited below. Its step 1 (line ~59) planned to
+> "run `dense_search` and `sparse_search` in parallel"; the shipped `hybrid_search`
+> (`src/search.rs:506-536`) does not do this — it constructs the dense future, runs sparse to
+> completion synchronously, and only then awaits dense, so the two channels execute
+> back-to-back rather than concurrently. See `CLAUDE.md`'s "Known Limitations" section for the
+> current behavior and the recommended (not yet implemented) fix. Treat this file as history,
+> not current fact.
+
 # Step 5 — Hybrid Search (`search.rs`) ⏳
 
 **Status:** Pending

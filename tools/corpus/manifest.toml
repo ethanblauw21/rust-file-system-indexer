@@ -1,0 +1,88 @@
+# tools/corpus/manifest.toml — pinned corpus roots for the search-eval harness (tools/eval_search.py).
+#
+# Mirrors the sibling `indexer` repo's ADR-019 pattern (benchmarks/real_repo/repos.toml):
+# every root is a PUBLIC repo pinned by exact commit SHA, so the union corpus is
+# reproducible by anyone, on any machine, from a clean `git clone` — never a personal
+# folder path. `tools/corpus/prepare_corpus.py` reads this file, clones each `[[root]]`
+# at its pinned `sha` into a git-ignored working dir, and (in a later step) indexes all
+# roots into one shared index directory via repeated `file_indexer index <root>` calls
+# (multi-root accumulation works post-Defect-6 — see docs/dogfooding/2026-06-22-dogfood-run.md).
+#
+# Provenance note (2026-07-08): the ORIGINAL 4.69-mean-robustness / 12-of-16 baseline was
+# measured against a DIFFERENT, non-reproducible union — codebase-indexer (92 files) +
+# ethan's personal homelab/OneDrive/Documents folders (1,526 files), 1,618 files total,
+# on a machine this repo cannot access. That exact corpus cannot be rebuilt from anything
+# committable. This manifest defines a NEW, fully-reproducible replacement union that
+# preserves the part that mattered — the "target" root the 16 fixture queries are actually
+# grounded in — and swaps ethan's personal distractor folders for pinned public repos with
+# comparable scale and topical diversity (code + docs, 5 languages). Running the harness
+# against this corpus will NOT reproduce "4.69" literally; it establishes a new baseline
+# number on a corpus that is provably rebuildable, which the old one was not. See
+# tools/README.md "Corpus provenance" for the full reasoning.
+
+# ── Target root ──────────────────────────────────────────────────────────────
+# Contains all 16 fixture query targets (tools/fixtures/queries.jsonl). This is the
+# `codebase-indexer` project referenced throughout docs/dogfooding/2026-06-22-dogfood-run.md
+# (hybrid_retriever.py, ast_chunker.py, incremental_indexer.py, adapters/cpp_adapter.py,
+# ADR-003/007/008/014/017, etc.) — the SAME project, reachable here by URL+SHA instead of
+# the `C:\Users\ethan\codebase-indexer` path the dogfood doc used.
+[[root]]
+name  = "codebase-indexer"
+kind  = "target"
+url   = "https://github.com/ethanblauw21/codebase-indexer.git"
+# Pinned to the commit checked out locally in the sibling repo (C:\Users\edb\Documents\indexer)
+# at the time this manifest was written. Confirmed pushed to origin (refs/heads/feature/adr-008-cpp-conformance,
+# also PR #17) so it is clonable from a clean machine. Re-pin if that branch is rebased/force-pushed;
+# prefer pinning to a merge-to-master commit once ADR-008 lands.
+sha   = "134908b5fe628cb2b4894420dc66530677def35f"
+notes = "~197 git-tracked files at this SHA (py/md/json/cs/ts/cpp mixed); holds all 16 fixture targets."
+
+# ── Distractor roots ─────────────────────────────────────────────────────────
+# Reused verbatim from the sibling repo's ADR-019 manifest (benchmarks/real_repo/repos.toml) —
+# already vetted there for permissive license + real cross-file structure + moderate size, and
+# already cloned locally under that repo's benchmarks/real_repo/corpus/. Picking the SAME five
+# repos means prepare_corpus.py can skip re-cloning if that sibling checkout is present (see
+# --reuse-sibling-cache in prepare_corpus.py), while remaining independently reproducible via
+# plain `git clone` + checkout if it is not. Purpose here is purely as ranking NOISE (unrelated
+# code+doc mass the 16 targets must still surface against) — the specific repos are incidental,
+# not content the eval queries target.
+[[root]]
+name  = "click"
+kind  = "distractor"
+url   = "https://github.com/pallets/click"
+sha   = "b2e30a175449cfda909ee4fbf4a29a6a071cad53"
+notes = "pallets/click @ v8.4.2, BSD-3, Python. ~175 files."
+
+[[root]]
+name  = "zustand"
+kind  = "distractor"
+url   = "https://github.com/pmndrs/zustand"
+sha   = "bfb2a9e7ce52608d54d8a077fb87ac9d12e73c58"
+notes = "pmndrs/zustand @ v5.0.14, MIT, TypeScript. ~168 files."
+
+[[root]]
+name  = "p-queue"
+kind  = "distractor"
+url   = "https://github.com/sindresorhus/p-queue"
+sha   = "cfa917af261fb6db9eb1281221ba21093eb49e3d"
+notes = "sindresorhus/p-queue @ v9.3.0, MIT, JavaScript. ~77 files."
+
+[[root]]
+name  = "serilog"
+kind  = "distractor"
+url   = "https://github.com/serilog/serilog"
+sha   = "0597ddfbd4ec594d9c42edd745fe728a2198bad9"
+notes = "serilog/serilog @ v4.3.1, Apache-2.0, C#. ~307 files."
+
+[[root]]
+name  = "spdlog"
+kind  = "distractor"
+url   = "https://github.com/gabime/spdlog"
+sha   = "79524ddd08a4ec981b7fea76afd08ee05f83755d"
+notes = "gabime/spdlog @ v1.17.0, MIT, C++. ~202 files."
+
+# Union scale at these pins: ~197 (target) + ~929 (distractors) ≈ 1,126 files — same order
+# of magnitude as the original 1,618-file union, not a bit-for-bit match. Add more [[root]]
+# entries (any permissively-licensed public repo) to push the scale closer to 1,618 if a
+# future experiment wants tighter parity; document the addition and re-derive the baseline
+# rather than silently changing corpus scale between a before/after pair.

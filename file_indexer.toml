@@ -1,0 +1,96 @@
+# file_indexer.toml — Optional per-corpus configuration for file_indexer.
+#
+# THIS FILE IS OPTIONAL. Its absence is the normal case: every setting below
+# falls back to an environment variable (where one existed pre-Phase-2) or a
+# hardcoded default baked into the binary. Nothing in this repo requires a
+# file_indexer.toml to exist — see src/config.rs.
+#
+# Resolution order for THIS FILE ITSELF (checked at `IncrementalIndexer::new` /
+# `Searcher::new` time, i.e. on every `index`/`search`/`tui`/`score`/`recheck`
+# run):
+#   1. <index_dir>/file_indexer.toml   (per-corpus override, next to enterprise.db)
+#   2. ./file_indexer.toml             (cwd fallback — this file, when run from
+#                                        the repo root)
+#   3. built-in defaults               (no file found — no error)
+#
+# Resolution order for each INDIVIDUAL setting below (CLI flag > config file >
+# built-in default), with two documented exceptions:
+#   - [fusion] weights keep their existing RRF_DENSE_WEIGHT / RRF_SPARSE_WEIGHT /
+#     PATH_BOOST_WEIGHT env-var override ON TOP of this file, for tuning sweeps
+#     without a rebuild (search.rs::FusionWeights::resolve). The env var wins
+#     over this file, which wins over the hardcoded constants in search.rs.
+#   - [indexer].extra_ignore_dirs is UNIONED with `index --exclude`, not
+#     overridden by it — more ignoring is always safe, so both apply together.
+#
+# [embedder].embedding_dim below is NOT a live control. It is validated against
+# this build's compiled EMBEDDING_DIM constant (src/indexer.rs) at startup and
+# a mismatch is a hard error (IndexerError::Config) — the running binary always
+# embeds at its compiled EMBEDDING_DIM regardless of what this file says.
+# Changing the actual dimension means editing EMBEDDING_DIM in src/indexer.rs,
+# rebuilding, and reindexing (`index --reindex`) — see CLAUDE.md's "Key Design
+# Decisions" section on the Matryoshka slice.
+
+[embedder]
+# Directory containing nomic-embed-text-v1.5.onnx + tokenizer.json.
+# Falls back to the NOMIC_ONNX_PATH environment variable when unset here.
+# Without either, index/search run in a degraded, explicitly-recorded mode:
+# `index` hard-errors unless run with --no-embed; `search` falls back to
+# sparse (FTS5)-only and prints a warning naming which case it hit.
+# onnx_model_dir = "C:/models/nomic-embed-text-v1.5"
+
+# Path to the ONNX Runtime shared library (onnxruntime.dll / .so / .dylib).
+# Falls back to the ORT_DYLIB_PATH environment variable when unset here.
+# A version-mismatched dylib doesn't error — it can hang inside the native
+# GetApi() call, which is why Embedder::load enforces load_timeout_secs below
+# instead of hanging the whole command indefinitely.
+# ort_dylib_path = "C:/onnxruntime/lib/onnxruntime.dll"
+
+# Output embedding dimension this corpus's vectors are stored at. VALIDATION
+# ONLY (see file header) — must equal the compiled EMBEDDING_DIM (currently 256,
+# the Matryoshka slice of nomic-embed-text-v1.5's 768-dim output) or startup
+# hard-errors with IndexerError::Config. Leave unset to skip the check entirely.
+# embedding_dim = 256
+
+# Reserved for a future phase: the ONNX Runtime version this corpus's embedder
+# was validated against. Parsed but not yet enforced anywhere.
+# required_onnxruntime_version = "1.18.0"
+
+# Seconds to wait for Embedder::load (ONNX session + tokenizer init) before
+# giving up. Guards against the ORT-dylib-version-mismatch hang described above.
+# Default: 30.
+# load_timeout_secs = 30
+
+[fusion]
+# Hybrid search RRF (Reciprocal Rank Fusion) weights — see search.rs for the
+# full rationale. All three default to the RRF_DENSE_WEIGHT / RRF_SPARSE_WEIGHT
+# / PATH_BOOST_WEIGHT constants in search.rs when unset here, and can still be
+# overridden per-run via the RRF_DENSE_WEIGHT / RRF_SPARSE_WEIGHT /
+# PATH_BOOST_WEIGHT env vars on top of whatever this file sets (tuning-only,
+# no rebuild required).
+
+# Weight of the dense (vector/ANN) retrieval channel. Default: 1.0.
+# dense_weight = 1.0
+
+# Weight of the sparse (BM25/FTS5) retrieval channel. Down-weighted from dense
+# by default (dogfooding finding M7 — unweighted BM25 keyword noise diluted
+# dense precision on this corpus). Default: 0.4.
+# sparse_weight = 0.4
+
+# Weight of the filename/path-token match bonus (finding M8/M9 — content
+# embeddings alone bury impl files under prose and miss literal basename
+# lookups). Scaled to roughly one rank-1 RRF channel. Default: 1.5.
+# path_weight = 1.5
+
+[indexer]
+# Additional directory names to ignore at any depth, on top of the storage
+# layer's built-in ignore list (node_modules, .git, target, etc. — see
+# storage.rs) AND on top of `index --exclude` (this list is UNIONED with
+# --exclude, not a substitute for it).
+# extra_ignore_dirs = ["vendor", "third_party"]
+
+# Number of chunks batched per embedding call and per LanceDB write. Larger
+# batches amortize per-call ONNX Runtime overhead but hold more text/vectors in
+# memory at once; smaller batches recover faster from a mid-run crash (fewer
+# chunks with lance_id IS NULL to re-embed on the next run). Overridable per-run
+# with `index --embed-batch-size`. Default: 32 (EMBED_BATCH_SIZE in indexer.rs).
+# embed_batch_size = 32

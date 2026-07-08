@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 #[allow(dead_code)]
 pub const HF_MODEL_ID:      &str   = "nomic-ai/nomic-embed-text-v1.5";
 /// Matryoshka slice dimension: first 256 of 768 dims (~1.5% accuracy drop, 66% storage reduction).
-/// Changing this constant requires `--reindex`; the LanceDB table is auto-dropped on dimension mismatch.
+/// Changing this constant requires re-indexing: on a stored-vs-expected dimension mismatch
+/// `LanceStore::open_or_create` hard-errors naming both dims unless `--reindex`
+/// (`force_recreate`) is passed to authorize the destructive table rebuild.
 pub const EMBEDDING_DIM:    usize  = 256;
 /// Embed batch size tuned for CPU inference.
 /// 256 was GPU-sized; at batch=256 × seq=512 the CPU takes 40–120 s per call.
@@ -30,6 +32,15 @@ pub const TRAIN_MIN:        usize  = 32;
 #[allow(dead_code)]
 pub const TRAIN_IDEAL:      usize  = 39 * TRAIN_MIN;
 const MIN_NLIST:            usize  = 4;
+/// Bound on how many ids are concatenated into a single `id IN (...)` filter
+/// string passed to LanceDB (`delete` / `only_if`). LanceDB filters are plain
+/// DataFusion SQL-expression strings, not bound parameters, so there is no
+/// hard protocol limit — but building one unbounded string for tens of
+/// thousands of ids risks pathological string-alloc cost and slow filter
+/// parsing. 1000 mirrors SQLite's own default `SQLITE_MAX_VARIABLE_NUMBER`
+/// (999) that already bounds `IN (...)` batches on the FTS5 side of this
+/// codebase, keeping id-batch sizing consistent across both stores.
+const MAX_IDS_PER_FILTER:   usize  = 1000;
 
 /// IVF-PQ partition count heuristic: 4√N clamped to [MIN_NLIST, 1024].
 pub fn compute_nlist(n: usize) -> usize {
@@ -131,7 +142,11 @@ async fn create_chunks_table(conn: &lancedb::Connection) -> Result<lancedb::Tabl
 }
 
 impl LanceStore {
-    pub async fn open_or_create(path: &Path) -> Result<Self, IndexerError> {
+    /// `force_recreate` permits the destructive drop-and-rebuild path on a vector
+    /// dimension mismatch (see below) — only `index --reindex` should pass `true`;
+    /// every other caller (search, ingest, recheck) must pass `false` so a stale
+    /// or misconfigured embedder can never silently wipe an existing vector table.
+    pub async fn open_or_create(path: &Path, force_recreate: bool) -> Result<Self, IndexerError> {
         std::fs::create_dir_all(path).map_err(|e| IndexerError::Io {
             path:   path.to_path_buf(),
             source: e,
@@ -150,15 +165,26 @@ impl LanceStore {
             });
             if stored_dim == Some(EMBEDDING_DIM as i32) {
                 t
-            } else {
+            } else if force_recreate {
                 tracing::warn!(
-                    "LanceDB vector dim mismatch (stored={:?}, expected={}); dropping table for rebuild",
+                    "LanceDB vector dim mismatch (stored={:?}, expected={}) — dropping and recreating (--reindex)",
                     stored_dim, EMBEDDING_DIM
                 );
                 conn.drop_table("chunks", &[])
                     .await
                     .map_err(|e| IndexerError::VectorStore(e.to_string()))?;
                 create_chunks_table(&conn).await?
+            } else {
+                return Err(IndexerError::VectorStore(format!(
+                    "LanceDB vector table dimension mismatch: stored table has vectors of dim={:?}, but this build \
+                     expects dim={} (EMBEDDING_DIM in src/indexer.rs). The embedding model or EMBEDDING_DIM changed \
+                     since this index was built; querying or adding vectors against the mismatched table would corrupt \
+                     or silently degrade dense search. This requires a one-time full reindex: rerun `index <root> \
+                     --reindex` to rebuild the vector table (this also re-chunks and re-embeds every file — existing \
+                     chunks/vectors are NOT preserved across --reindex), or point --index-dir at a fresh directory. \
+                     Refusing to auto-drop the existing vector table.",
+                    stored_dim, EMBEDDING_DIM
+                )));
             }
         } else {
             create_chunks_table(&conn).await?
@@ -194,11 +220,13 @@ impl LanceStore {
         if ids.is_empty() {
             return Ok(());
         }
-        let id_list: String = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-        self.table
-            .delete(&format!("id IN ({})", id_list))
-            .await
-            .map_err(|e| IndexerError::VectorStore(e.to_string()))?;
+        for batch in ids.chunks(MAX_IDS_PER_FILTER) {
+            let id_list: String = batch.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+            self.table
+                .delete(&format!("id IN ({})", id_list))
+                .await
+                .map_err(|e| IndexerError::VectorStore(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -255,38 +283,40 @@ impl LanceStore {
             return Ok(HashMap::new());
         }
 
-        let id_list: String = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-        let mut stream = self.table
-            .query()
-            .only_if(format!("id IN ({})", id_list))
-            .execute()
-            .await
-            .map_err(|e| IndexerError::VectorStore(e.to_string()))?;
-
         let mut result: HashMap<i64, Vec<f32>> = HashMap::new();
-        while let Some(batch) = stream
-            .try_next()
-            .await
-            .map_err(|e| IndexerError::VectorStore(e.to_string()))?
-        {
-            let id_col = batch
-                .column_by_name("id")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                .ok_or_else(|| IndexerError::VectorStore("missing 'id' column".into()))?;
-            let vec_col = batch
-                .column_by_name("vector")
-                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
-                .ok_or_else(|| IndexerError::VectorStore("missing 'vector' column".into()))?;
+        for id_batch in ids.chunks(MAX_IDS_PER_FILTER) {
+            let id_list: String = id_batch.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+            let mut stream = self.table
+                .query()
+                .only_if(format!("id IN ({})", id_list))
+                .execute()
+                .await
+                .map_err(|e| IndexerError::VectorStore(e.to_string()))?;
 
-            for i in 0..batch.num_rows() {
-                let id   = id_col.value(i);
-                let vals = vec_col.value(i);
-                let floats = vals
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| IndexerError::VectorStore("vector values not f32".into()))?;
-                let vec: Vec<f32> = (0..floats.len()).map(|j| floats.value(j)).collect();
-                result.insert(id, vec);
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|e| IndexerError::VectorStore(e.to_string()))?
+            {
+                let id_col = batch
+                    .column_by_name("id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .ok_or_else(|| IndexerError::VectorStore("missing 'id' column".into()))?;
+                let vec_col = batch
+                    .column_by_name("vector")
+                    .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+                    .ok_or_else(|| IndexerError::VectorStore("missing 'vector' column".into()))?;
+
+                for i in 0..batch.num_rows() {
+                    let id   = id_col.value(i);
+                    let vals = vec_col.value(i);
+                    let floats = vals
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .ok_or_else(|| IndexerError::VectorStore("vector values not f32".into()))?;
+                    let vec: Vec<f32> = (0..floats.len()).map(|j| floats.value(j)).collect();
+                    result.insert(id, vec);
+                }
             }
         }
         Ok(result)
@@ -322,19 +352,67 @@ impl LanceStore {
 
 // ── Embedder (ONNX Runtime + tokenizers) ─────────────────────────────────────
 
+/// Runs `f` on a dedicated thread and waits up to `timeout` for it to finish.
+/// A version-mismatched ONNX Runtime DLL can wedge indefinitely inside its own
+/// native `GetApi()` call instead of returning an error (see the dogfood doc's
+/// Defect 1) — we can't kill a stuck native call, but we CAN stop waiting on it
+/// and surface a loud timeout error to the caller instead of hanging the whole
+/// `index`/`search` command. The spawned thread is intentionally leaked on
+/// timeout; there is no safe way to cancel a blocked FFI call from Rust.
+fn run_with_timeout<T, F>(timeout: std::time::Duration, f: F) -> Result<T, IndexerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, IndexerError> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(IndexerError::Embedding(format!(
+            "ONNX Runtime did not finish loading within {:?}. This almost always means \
+             ORT_DYLIB_PATH points at an onnxruntime build whose version doesn't match what this \
+             binary was compiled against (api-24, i.e. onnxruntime 1.24.x — see \
+             docs/dogfooding/2026-06-22-dogfood-run.md Defect 1). Point ORT_DYLIB_PATH at the \
+             documented onnxruntime 1.24.2 build and retry.",
+            timeout
+        ))),
+    }
+}
+
 pub struct Embedder {
     session:   Mutex<ort::session::Session>,
     tokenizer: tokenizers::Tokenizer,
 }
 
 impl Embedder {
-    pub fn load(onnx_dir: &Path) -> Result<Self, IndexerError> {
+    /// Loads the ONNX Runtime session + tokenizer with a hard timeout. A
+    /// version-mismatched ORT dylib doesn't return an error from `ort::init_from` —
+    /// it can hang indefinitely inside the native `GetApi()` call (see dogfood doc
+    /// Defect 1), which would otherwise wedge the whole `index`/`search` command
+    /// with no diagnostic. `ort_dylib_path` overrides `ORT_DYLIB_PATH` when set.
+    pub fn load(
+        onnx_dir: &Path,
+        ort_dylib_path: Option<&str>,
+        load_timeout: std::time::Duration,
+    ) -> Result<Self, IndexerError> {
+        let onnx_dir = onnx_dir.to_path_buf();
+        let ort_dylib_path = ort_dylib_path.map(str::to_string);
+        run_with_timeout(load_timeout, move || {
+            Self::load_inner(&onnx_dir, ort_dylib_path.as_deref())
+        })
+    }
+
+    fn load_inner(onnx_dir: &Path, ort_dylib_path: Option<&str>) -> Result<Self, IndexerError> {
         use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 
         let model_path = onnx_dir.join("nomic-embed-text-v1.5.onnx");
         let tok_path   = onnx_dir.join("tokenizer.json");
 
-        let ort_dll = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
+        let ort_dll = ort_dylib_path.map(str::to_string)
+            .or_else(|| std::env::var("ORT_DYLIB_PATH").ok())
+            .unwrap_or_default();
         ort::init_from(&ort_dll)
             .map_err(|e| IndexerError::Embedding(format!("ORT DLL load failed: {e}")))?
             .commit();
@@ -610,21 +688,31 @@ pub struct IngestRecord {
 // ── IncrementalIndexer ────────────────────────────────────────────────────────
 
 pub struct IncrementalIndexer {
-    pub storage:      Arc<dyn StorageClient>,
+    pub storage:          Arc<dyn StorageClient>,
     #[allow(dead_code)]
-    pub chunker:      FileChunker,
-    pub db:           Arc<EnterpriseDb>,
-    pub vectors:      LanceStore,
-    pub chunker_map:  ChunkerMap,
+    pub chunker:          FileChunker,
+    pub db:               Arc<EnterpriseDb>,
+    pub vectors:          LanceStore,
+    pub chunker_map:      ChunkerMap,
     #[allow(dead_code)]
-    pub index_dir:    PathBuf,
-    embedder:         Option<Arc<Embedder>>,
+    pub index_dir:        PathBuf,
+    /// Per-instance embed batch size, resolved from `file_indexer.toml`
+    /// (`[indexer].embed_batch_size`) with `EMBED_BATCH_SIZE` as the default.
+    /// Overridable by the caller after construction (e.g. `index --embed-batch-size`).
+    pub embed_batch_size: usize,
+    embedder:             Option<Arc<Embedder>>,
 }
 
 impl IncrementalIndexer {
+    /// `force_recreate` is threaded into `LanceStore::open_or_create` — it permits
+    /// dropping and rebuilding the vector table on a dimension mismatch. Only
+    /// `index --reindex` should pass `true`; every other caller (ingest, recheck)
+    /// passes `false` so a stale/misconfigured embedder can never silently wipe an
+    /// existing vector table.
     pub async fn new(
-        storage:   Arc<dyn StorageClient>,
-        index_dir: &Path,
+        storage:        Arc<dyn StorageClient>,
+        index_dir:      &Path,
+        force_recreate: bool,
     ) -> Result<Self, IndexerError> {
         std::fs::create_dir_all(index_dir).map_err(|e| IndexerError::Io {
             path:   index_dir.to_path_buf(),
@@ -632,12 +720,22 @@ impl IncrementalIndexer {
         })?;
         let db_path     = index_dir.join("enterprise.db");
         let db          = Arc::new(EnterpriseDb::new(&db_path)?);
-        let vectors     = LanceStore::open_or_create(&index_dir.join("lance")).await?;
+        let vectors     = LanceStore::open_or_create(&index_dir.join("lance"), force_recreate).await?;
         let chunker_map = ChunkerMap::load_or_create(index_dir)?;
 
-        let embedder = std::env::var("NOMIC_ONNX_PATH")
-            .ok()
-            .and_then(|p| Embedder::load(Path::new(&p)).ok())
+        let raw_config = crate::config::RawConfig::load(index_dir)?;
+        raw_config.validate_embedding_dim(EMBEDDING_DIM)?;
+        let embed_batch_size = crate::config::resolve(None, raw_config.indexer.embed_batch_size, EMBED_BATCH_SIZE);
+
+        let onnx_dir = raw_config.embedder.onnx_model_dir.clone()
+            .or_else(|| std::env::var("NOMIC_ONNX_PATH").ok());
+        let ort_dylib = raw_config.embedder.ort_dylib_path.clone()
+            .or_else(|| std::env::var("ORT_DYLIB_PATH").ok());
+        let ort_load_timeout = std::time::Duration::from_secs(
+            raw_config.embedder.load_timeout_secs.unwrap_or(30)
+        );
+        let embedder = onnx_dir
+            .and_then(|p| Embedder::load(Path::new(&p), ort_dylib.as_deref(), ort_load_timeout).ok())
             .map(Arc::new);
 
         Ok(Self {
@@ -647,8 +745,19 @@ impl IncrementalIndexer {
             vectors,
             chunker_map,
             index_dir: index_dir.to_path_buf(),
+            embed_batch_size,
             embedder,
         })
+    }
+
+    /// Test-only override to deterministically force the "no embedder" branch,
+    /// regardless of whether `NOMIC_ONNX_PATH` happens to be set in the ambient
+    /// test environment — avoids mutating a global env var, which would race with
+    /// other parallel tests.
+    #[cfg(test)]
+    pub(crate) fn with_embedder_for_test(mut self, embedder: Option<Arc<Embedder>>) -> Self {
+        self.embedder = embedder;
+        self
     }
 
     #[allow(clippy::type_complexity)]
@@ -656,9 +765,22 @@ impl IncrementalIndexer {
         &self,
         root_uri:    &str,
         reindex:     bool,
+        no_embed:    bool,
         on_start:    Option<&(dyn Fn(usize) + Sync)>,
         on_progress: Option<&(dyn Fn(usize, usize, &Stats) + Sync)>,
     ) -> Result<Stats, IndexerError> {
+        if !no_embed && self.embedder.is_none() {
+            return Err(IndexerError::NoEmbedder(
+                "index requires an embedder for dense/hybrid search, but none is configured or it failed to \
+                 load. Set NOMIC_ONNX_PATH to a directory containing nomic-embed-text-v1.5.onnx + \
+                 tokenizer.json, and ensure ORT_DYLIB_PATH points at a matching onnxruntime build. If you \
+                 intend to build a sparse-only (BM25) index on purpose, rerun with --no-embed — this is \
+                 recorded in the index so search/score report the reduced mode plainly."
+                    .to_string(),
+            ));
+        }
+        self.db.set_meta("embed_mode", if no_embed { "no_embed" } else { "enabled" })?;
+
         let mut stats = Stats::default();
 
         if reindex {
@@ -735,7 +857,7 @@ impl IncrementalIndexer {
                     )?;
                     stats.indexed += 1;
 
-                    if text_buffer.len() >= EMBED_BATCH_SIZE {
+                    if !no_embed && text_buffer.len() >= self.embed_batch_size {
                         self.flush_embeddings(
                             &text_buffer, &lance_id_buf, &chunk_id_buf, &tier_buf,
                         ).await?;
@@ -759,7 +881,7 @@ impl IncrementalIndexer {
         phase1.await.map_err(|e| IndexerError::Other(e.to_string().into()))?;
 
         // Final flush for any chunks accumulated since the last EMBED_BATCH_SIZE boundary.
-        if !text_buffer.is_empty() {
+        if !no_embed && !text_buffer.is_empty() {
             self.flush_embeddings(&text_buffer, &lance_id_buf, &chunk_id_buf, &tier_buf).await?;
         }
 
@@ -872,6 +994,26 @@ impl IncrementalIndexer {
             return Ok(Stats::default());
         }
 
+        // Gate on the index's RECORDED mode, not a caller-supplied flag: `index_uris`
+        // has no `no_embed` parameter of its own, because recheck must not wrongly
+        // hard-error on a corpus that was deliberately built with `--no-embed` (mode
+        // recorded `no_embed` → skip embedding silently, as before). A corpus that WAS
+        // supposed to have embeddings but whose embedder is now broken/missing DOES
+        // hard-error — closing the same silent-degradation hole for recheck, not just
+        // plain `index`.
+        let recorded_mode = self.db.get_meta("embed_mode")?;
+        let no_embed = recorded_mode.as_deref() == Some("no_embed");
+        if !no_embed && self.embedder.is_none() {
+            let mode_label = recorded_mode.as_deref().unwrap_or("unset (pre-dates embed_mode tracking)");
+            return Err(IndexerError::NoEmbedder(format!(
+                "recheck cannot re-embed drifted files: this index's recorded embed_mode is '{}' (embeddings \
+                 expected), but no embedder is configured/available right now. Configure NOMIC_ONNX_PATH and \
+                 retry, or rebuild the whole index with `index --reindex --no-embed` to intentionally switch \
+                 this corpus to sparse-only.",
+                mode_label
+            )));
+        }
+
         let mut stats = Stats::default();
         let all_info  = self.db.get_all_file_info()?;
 
@@ -902,7 +1044,7 @@ impl IncrementalIndexer {
             }
         }
 
-        if !text_buffer.is_empty() {
+        if !no_embed && !text_buffer.is_empty() {
             self.flush_embeddings(&text_buffer, &lance_id_buf, &chunk_id_buf, &tier_buf).await?;
         }
 
@@ -983,7 +1125,7 @@ impl IncrementalIndexer {
             )?;
             stats.indexed += 1;
 
-            if text_buffer.len() >= EMBED_BATCH_SIZE {
+            if text_buffer.len() >= self.embed_batch_size {
                 self.flush_embeddings(&text_buffer, &lance_id_buf, &chunk_id_buf, &tier_buf).await?;
                 text_buffer.clear();
                 lance_id_buf.clear();
@@ -1018,11 +1160,11 @@ impl IncrementalIndexer {
             Some(e) => e.clone(),
             None    => return Ok(()),
         };
-        for i in (0..texts.len()).step_by(EMBED_BATCH_SIZE) {
-            let end          = (i + EMBED_BATCH_SIZE).min(texts.len());
+        for i in (0..texts.len()).step_by(self.embed_batch_size) {
+            let end          = (i + self.embed_batch_size).min(texts.len());
             let batch_owned: Vec<String> = texts[i..end].to_vec();
             let batch_n      = batch_owned.len();
-            tracing::info!("Embedding batch {}/{} ({} chunks)", i / EMBED_BATCH_SIZE + 1, texts.len().div_ceil(EMBED_BATCH_SIZE), batch_n);
+            tracing::info!("Embedding batch {}/{} ({} chunks)", i / self.embed_batch_size + 1, texts.len().div_ceil(self.embed_batch_size), batch_n);
             let emb          = embedder.clone();
             let vecs         = tokio::task::spawn_blocking(move || {
                 let batch_refs: Vec<&str> = batch_owned.iter().map(String::as_str).collect();
@@ -1106,7 +1248,7 @@ mod tests {
 
     fn load_embedder() -> Option<Embedder> {
         let path = std::env::var("NOMIC_ONNX_PATH").ok()?;
-        Embedder::load(Path::new(&path)).ok()
+        Embedder::load(Path::new(&path), None, std::time::Duration::from_secs(30)).ok()
     }
 
     #[test]
@@ -1141,6 +1283,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_with_timeout_returns_err_on_hang() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let result = run_with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok::<u32, IndexerError>(1)
+        });
+        assert!(result.is_err(), "hung closure should time out with an error");
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "caller should not block for the full closure duration, elapsed={:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_ok_when_fast() {
+        use std::time::Duration;
+        let result = run_with_timeout(Duration::from_secs(5), || Ok::<u32, IndexerError>(42));
+        assert_eq!(result.unwrap(), 42);
+    }
+
     fn make_unit_vecs(n: usize) -> Vec<Vec<f32>> {
         (0..n).map(|i| {
             let mut v = vec![0.0f32; EMBEDDING_DIM];
@@ -1152,7 +1317,7 @@ mod tests {
     #[tokio::test]
     async fn lancedb_add_and_search() {
         let dir   = TempDir::new().unwrap();
-        let store = LanceStore::open_or_create(dir.path()).await.unwrap();
+        let store = LanceStore::open_or_create(dir.path(), false).await.unwrap();
 
         let ids       = vec![1i64, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let chunk_ids = ids.clone();
@@ -1171,7 +1336,7 @@ mod tests {
     #[tokio::test]
     async fn lancedb_remove_ids() {
         let dir   = TempDir::new().unwrap();
-        let store = LanceStore::open_or_create(dir.path()).await.unwrap();
+        let store = LanceStore::open_or_create(dir.path(), false).await.unwrap();
 
         let ids   = vec![100i64, 200, 300];
         let vecs  = make_unit_vecs(3);
@@ -1186,6 +1351,113 @@ mod tests {
             results.iter().all(|r| r.id != 200),
             "removed id=200 should not appear in search results"
         );
+    }
+
+    // Proves remove_ids batches its `id IN (...)` filter: with more ids than
+    // MAX_IDS_PER_FILTER, a bug that only issued the first chunk's delete (or
+    // dropped later chunks) would leave the tail ids behind instead of
+    // ntotal() == 0.
+    #[tokio::test]
+    async fn lancedb_remove_ids_spans_multiple_filter_batches() {
+        let dir   = TempDir::new().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), false).await.unwrap();
+
+        let n: i64 = MAX_IDS_PER_FILTER as i64 + 500; // forces 2 batches (1000 + 500)
+        let ids: Vec<i64> = (1..=n).collect();
+        let vecs = make_unit_vecs(n as usize);
+        store.add_vectors(&ids, &ids, &vec![1u8; n as usize], &vecs).await.unwrap();
+        assert_eq!(store.ntotal().await.unwrap(), n as usize);
+
+        store.remove_ids(&ids).await.unwrap();
+        assert_eq!(
+            store.ntotal().await.unwrap(), 0,
+            "all ids should be removed, including the tail past MAX_IDS_PER_FILTER"
+        );
+    }
+
+    // Proves fetch_vectors_by_ids batches its `id IN (...)` filter and merges
+    // results across batches: a bug that only queried the first chunk would
+    // silently under-return the map instead of erroring.
+    #[tokio::test]
+    async fn lancedb_fetch_vectors_by_ids_spans_multiple_filter_batches() {
+        let dir   = TempDir::new().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), false).await.unwrap();
+
+        let n: i64 = MAX_IDS_PER_FILTER as i64 + 500; // forces 2 batches (1000 + 500)
+        let ids: Vec<i64> = (1..=n).collect();
+        let vecs = make_unit_vecs(n as usize);
+        store.add_vectors(&ids, &ids, &vec![1u8; n as usize], &vecs).await.unwrap();
+
+        let fetched = store.fetch_vectors_by_ids(&ids).await.unwrap();
+        assert_eq!(
+            fetched.len(), n as usize,
+            "every id across every batch should be fetched, including the tail past MAX_IDS_PER_FILTER"
+        );
+        assert!(fetched.contains_key(&1), "first-batch id should be present");
+        assert!(fetched.contains_key(&n), "id from the batch past MAX_IDS_PER_FILTER should be present");
+    }
+
+    /// Builds a "chunks" table schema identical to `chunks_schema()` except the
+    /// vector width is `dim` instead of `EMBEDDING_DIM` — used to simulate a stale
+    /// table left behind by an older/different embedding model.
+    fn mismatched_chunks_schema(dim: i32) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id",       DataType::Int64, false),
+            Field::new("chunk_id", DataType::Int64, false),
+            Field::new("tier",     DataType::Int8,  false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim,
+                ),
+                false,
+            ),
+        ]))
+    }
+
+    async fn create_mismatched_chunks_table(dir: &std::path::Path, dim: i32) {
+        let uri  = dir.to_string_lossy();
+        let conn = lancedb::connect(uri.as_ref()).execute().await.unwrap();
+        let schema      = mismatched_chunks_schema(dim);
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(empty_batch)].into_iter(), schema),
+        );
+        conn.create_table("chunks", reader).execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lance_store_dim_mismatch_without_force_recreate_errors() {
+        let dir = TempDir::new().unwrap();
+        create_mismatched_chunks_table(dir.path(), 128).await;
+
+        let result = LanceStore::open_or_create(dir.path(), false).await;
+        let msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_)  => panic!("dim mismatch without force_recreate should error"),
+        };
+        assert!(msg.contains("128"), "error should mention the stored dim, got: {msg}");
+        assert!(
+            msg.contains(&EMBEDDING_DIM.to_string()),
+            "error should mention the expected dim, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lance_store_dim_mismatch_with_force_recreate_drops_and_rebuilds() {
+        let dir = TempDir::new().unwrap();
+        create_mismatched_chunks_table(dir.path(), 128).await;
+
+        let store = LanceStore::open_or_create(dir.path(), true).await.unwrap();
+        assert_eq!(store.ntotal().await.unwrap(), 0, "recreated table should start empty");
+
+        // Proves the recreated table has the CORRECT (EMBEDDING_DIM) schema, not the
+        // stale mismatched one — adding a real-width vector must succeed.
+        let ids  = vec![1i64];
+        let vecs = make_unit_vecs(1);
+        store.add_vectors(&ids, &ids, &[1u8], &vecs).await.unwrap();
+        assert_eq!(store.ntotal().await.unwrap(), 1);
     }
 
     #[test]
@@ -1221,13 +1493,187 @@ mod tests {
         let indexer  = IncrementalIndexer::new(
             storage.clone(),
             idx_dir.path(),
+            false,
         ).await.unwrap();
 
-        let stats1   = indexer.index_root(&root_dir.path().to_string_lossy(), false, None, None).await.unwrap();
+        let stats1   = indexer.index_root(&root_dir.path().to_string_lossy(), false, false, None, None).await.unwrap();
         assert_eq!(stats1.indexed, 1, "first run should index 1 file");
 
-        let stats2   = indexer.index_root(&root_dir.path().to_string_lossy(), false, None, None).await.unwrap();
+        let stats2   = indexer.index_root(&root_dir.path().to_string_lossy(), false, false, None, None).await.unwrap();
         assert_eq!(stats2.indexed, 0, "second run should skip unchanged file");
+    }
+
+    #[tokio::test]
+    async fn index_root_hard_errors_without_embedder_and_without_no_embed() {
+        use crate::storage::LocalStorageClient;
+
+        let root_dir = TempDir::new().unwrap();
+        let idx_dir  = TempDir::new().unwrap();
+        std::fs::write(root_dir.path().join("hello.txt"), b"hello world").unwrap();
+
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false)
+            .await.unwrap()
+            .with_embedder_for_test(None);
+
+        let result = indexer
+            .index_root(&root_dir.path().to_string_lossy(), false, false, None, None)
+            .await;
+        assert!(
+            matches!(result, Err(IndexerError::NoEmbedder(_))),
+            "index without an embedder and without --no-embed should hard-error, got: {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[tokio::test]
+    async fn index_root_no_embed_flag_succeeds_and_records_mode() {
+        use crate::storage::LocalStorageClient;
+
+        let root_dir = TempDir::new().unwrap();
+        let idx_dir  = TempDir::new().unwrap();
+        let file_uri = root_dir.path().join("hello.txt").to_string_lossy().to_string();
+        std::fs::write(&file_uri, b"hello world").unwrap();
+
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false)
+            .await.unwrap()
+            .with_embedder_for_test(None);
+
+        let result = indexer
+            .index_root(&root_dir.path().to_string_lossy(), false, true, None, None)
+            .await;
+        assert!(result.is_ok(), "index with --no-embed should succeed without an embedder: {:?}", result.err());
+
+        assert_eq!(
+            indexer.db.get_meta("embed_mode").unwrap(),
+            Some("no_embed".to_string()),
+            "embed_mode should be recorded as no_embed"
+        );
+
+        // Sparse-only indexing worked and is self-describing: chunks exist, but none
+        // carry a lance_id (not a partial/broken embed — a deliberate no-embed run).
+        let chunks = indexer.db.get_chunks_for_file(&file_uri).unwrap();
+        assert!(!chunks.is_empty(), "file should still produce chunks under --no-embed");
+        assert!(
+            chunks.iter().all(|c| c.lance_id.is_none()),
+            "no chunk should have a lance_id when --no-embed was used"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_root_records_enabled_mode_when_embedder_present() {
+        if std::env::var("NOMIC_ONNX_PATH").is_err() {
+            println!("SKIP: NOMIC_ONNX_PATH not set");
+            return;
+        }
+        use crate::storage::LocalStorageClient;
+
+        let root_dir = TempDir::new().unwrap();
+        let idx_dir  = TempDir::new().unwrap();
+        std::fs::write(root_dir.path().join("hello.txt"), b"hello world").unwrap();
+
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false).await.unwrap();
+
+        let result = indexer
+            .index_root(&root_dir.path().to_string_lossy(), false, false, None, None)
+            .await;
+        assert!(result.is_ok(), "index with a real embedder should succeed: {:?}", result.err());
+        assert_eq!(indexer.db.get_meta("embed_mode").unwrap(), Some("enabled".to_string()));
+    }
+
+    #[tokio::test]
+    async fn embed_batch_size_defaults_to_const_when_no_config() {
+        use crate::storage::LocalStorageClient;
+
+        let idx_dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false).await.unwrap();
+
+        assert_eq!(indexer.embed_batch_size, EMBED_BATCH_SIZE);
+    }
+
+    #[tokio::test]
+    async fn embed_batch_size_reads_from_config_file() {
+        use crate::storage::LocalStorageClient;
+
+        let idx_dir = TempDir::new().unwrap();
+        std::fs::write(
+            idx_dir.path().join("file_indexer.toml"),
+            "[indexer]\nembed_batch_size = 7\n",
+        ).unwrap();
+
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false).await.unwrap();
+
+        assert_eq!(indexer.embed_batch_size, 7);
+    }
+
+    #[tokio::test]
+    async fn embedding_dim_mismatch_in_config_hard_errors() {
+        use crate::storage::LocalStorageClient;
+
+        let idx_dir = TempDir::new().unwrap();
+        std::fs::write(
+            idx_dir.path().join("file_indexer.toml"),
+            "[embedder]\nembedding_dim = 768\n",
+        ).unwrap();
+
+        let storage = Arc::new(LocalStorageClient::new());
+        let result = IncrementalIndexer::new(storage, idx_dir.path(), false).await;
+
+        assert!(
+            matches!(result, Err(IndexerError::Config(_))),
+            "embedding_dim mismatch in file_indexer.toml should hard-error, got: {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[tokio::test]
+    async fn index_uris_skips_embedding_silently_when_recorded_no_embed() {
+        use crate::storage::LocalStorageClient;
+
+        let root_dir = TempDir::new().unwrap();
+        let idx_dir  = TempDir::new().unwrap();
+        let file_uri = root_dir.path().join("hello.txt").to_string_lossy().to_string();
+        std::fs::write(&file_uri, b"hello world").unwrap();
+
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false)
+            .await.unwrap()
+            .with_embedder_for_test(None);
+
+        indexer
+            .index_root(&root_dir.path().to_string_lossy(), false, true, None, None)
+            .await.unwrap();
+
+        let result = indexer.index_uris(&[file_uri]).await;
+        assert!(
+            result.is_ok(),
+            "recheck on an intentionally-no-embed corpus should not hard-error: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn index_uris_hard_errors_when_recorded_enabled_but_embedder_missing() {
+        use crate::storage::LocalStorageClient;
+
+        let idx_dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorageClient::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false)
+            .await.unwrap()
+            .with_embedder_for_test(None);
+
+        indexer.db.set_meta("embed_mode", "enabled").unwrap();
+
+        let result = indexer.index_uris(&["file:///does/not/matter".to_string()]).await;
+        assert!(
+            matches!(result, Err(IndexerError::NoEmbedder(_))),
+            "recheck on a recorded-enabled corpus with no embedder should hard-error, got: {:?}",
+            result.map(|_| ())
+        );
     }
 
     // Push ingress: runs WITHOUT a model. The embedder is optional, so a pushed
@@ -1240,7 +1686,7 @@ mod tests {
         let idx_dir = TempDir::new().unwrap();
         // The push path never touches storage, but the constructor requires one.
         let storage = Arc::new(LocalStorageClient::new());
-        let indexer = IncrementalIndexer::new(storage, idx_dir.path()).await.unwrap();
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false).await.unwrap();
 
         let uri = "change://105/etc/nginx.conf@2026-06-22T18:03:01Z";
         let record = IngestRecord {
@@ -1279,7 +1725,7 @@ mod tests {
 
         let idx_dir = TempDir::new().unwrap();
         let storage = Arc::new(LocalStorageClient::new());
-        let indexer = IncrementalIndexer::new(storage, idx_dir.path()).await.unwrap();
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false).await.unwrap();
 
         let uri = "change://1/config";
         let mk  = |body: &str| IngestRecord {
