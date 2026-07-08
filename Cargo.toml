@@ -34,7 +34,7 @@ encoding_rs = "0.8"          # robust charset detection for CSV streams
 csv = "1"                    # RFC-4180 CSV parser (used in parse_csv)
 
 # ── Step 4 deps (indexer / embedder) ─────────────────────────────────────────
-ort       = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+ort       = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
 tokenizers = "0.23"
 ndarray   = "0.16"
 lancedb   = "0.27"

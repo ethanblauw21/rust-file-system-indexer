@@ -600,7 +600,11 @@ impl App {
 
         tokio::spawn(async move {
             let storage = Arc::new(LocalStorageClient::new());
-            let indexer = match IncrementalIndexer::new(storage, &index_dir).await {
+            // force_recreate=false: the TUI's index trigger never destroys the vector
+            // table on a dim mismatch. no_embed=false: same default as `index` with no
+            // --no-embed — a missing/broken embedder surfaces as a loud error in the
+            // indexing log below rather than silently degrading to sparse-only.
+            let indexer = match IncrementalIndexer::new(storage, &index_dir, false).await {
                 Ok(i)  => i,
                 Err(e) => { let _ = tx.try_send(format!("Error: {e}")); return; }
             };
@@ -611,7 +615,7 @@ impl App {
                     checked, total, s.indexed, s.skipped, s.errors,
                 ));
             };
-            match indexer.index_root(&root_str, false, None, Some(&on_progress)).await {
+            match indexer.index_root(&root_str, false, false, None, Some(&on_progress)).await {
                 Ok(s)  => { let _ = tx.try_send(format!("Done — {} indexed, {} skipped, {} errors", s.indexed, s.skipped, s.errors)); }
                 Err(e) => { let _ = tx.try_send(format!("Error: {e}")); }
             }

@@ -54,6 +54,21 @@ pub enum IndexerError {
     #[error("vector store error: {0}")]
     VectorStore(String),
 
+    /// No embedder is configured/available and the caller did not opt into a
+    /// deliberately embedder-less run (`--no-embed`). Distinct from `Embedding`,
+    /// which covers failures *during* an attempted embed call — this variant means
+    /// embedding was never attempted because no embedder could be constructed, and
+    /// the caller must either fix the embedder or explicitly opt out.
+    #[error("{0}")]
+    NoEmbedder(String),
+
+    /// Configuration is present but internally inconsistent or invalid — e.g. a
+    /// declared `embedding_dim` that disagrees with the binary's compiled
+    /// `EMBEDDING_DIM`. (Used by a follow-up Phase 2 config module; add the variant
+    /// now so Phase 2 doesn't need to touch this enum again.)
+    #[error("configuration error: {0}")]
+    Config(String),
+
     /// Any other error not covered above (escape hatch for third-party crates).
     #[error("unexpected error: {0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),

@@ -31,16 +31,27 @@ pub struct FusionWeights {
 }
 
 impl FusionWeights {
-    /// Resolve weights, allowing env overrides for tuning sweeps without a rebuild
-    /// (`RRF_DENSE_WEIGHT` / `RRF_SPARSE_WEIGHT` / `PATH_BOOST_WEIGHT`).
-    fn resolve() -> Self {
+    /// Resolve weights: env var (tuning-only, unchanged priority — see module docs)
+    /// overrides `file_defaults`, which itself is file_indexer.toml > the hardcoded
+    /// RRF_*_WEIGHT / PATH_BOOST_WEIGHT constants (computed once by the caller via
+    /// `FusionWeights::from_config`).
+    fn resolve(file_defaults: FusionWeights) -> Self {
         let parse = |k: &str, default: f64| {
             std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(default)
         };
         Self {
-            dense:  parse("RRF_DENSE_WEIGHT",  RRF_DENSE_WEIGHT),
-            sparse: parse("RRF_SPARSE_WEIGHT", RRF_SPARSE_WEIGHT),
-            path:   parse("PATH_BOOST_WEIGHT", PATH_BOOST_WEIGHT),
+            dense:  parse("RRF_DENSE_WEIGHT",  file_defaults.dense),
+            sparse: parse("RRF_SPARSE_WEIGHT", file_defaults.sparse),
+            path:   parse("PATH_BOOST_WEIGHT", file_defaults.path),
+        }
+    }
+
+    /// Build the file>default base (no env involved) from a loaded config.
+    fn from_config(raw: &crate::config::RawConfig) -> Self {
+        Self {
+            dense:  raw.fusion.dense_weight.unwrap_or(RRF_DENSE_WEIGHT),
+            sparse: raw.fusion.sparse_weight.unwrap_or(RRF_SPARSE_WEIGHT),
+            path:   raw.fusion.path_weight.unwrap_or(PATH_BOOST_WEIGHT),
         }
     }
 }
@@ -115,6 +126,7 @@ pub struct Searcher {
     pub db:       Arc<EnterpriseDb>,
     pub vectors:  Arc<LanceStore>,
     pub embedder: Option<Arc<Embedder>>,
+    fusion_defaults: FusionWeights,
 }
 
 impl Searcher {
@@ -123,14 +135,24 @@ impl Searcher {
 
         let db_path = index_dir.join("enterprise.db");
         let db      = Arc::new(EnterpriseDb::new(&db_path)?);
-        let vectors = Arc::new(LanceStore::open_or_create(&index_dir.join("lance")).await?);
+        // Search must NEVER force-recreate the vector table on a dim mismatch —
+        // only `index --reindex` may perform that destructive rebuild.
+        let vectors = Arc::new(LanceStore::open_or_create(&index_dir.join("lance"), false).await?);
 
-        let embedder = std::env::var("NOMIC_ONNX_PATH")
-            .ok()
-            .and_then(|p| Embedder::load(Path::new(&p)).ok())
+        let raw_config = crate::config::RawConfig::load(index_dir)?;
+        raw_config.validate_embedding_dim(crate::indexer::EMBEDDING_DIM)?;
+        let fusion_defaults = FusionWeights::from_config(&raw_config);
+
+        let onnx_dir = raw_config.embedder.onnx_model_dir.clone()
+            .or_else(|| std::env::var("NOMIC_ONNX_PATH").ok());
+        let ort_dylib = raw_config.embedder.ort_dylib_path.clone()
+            .or_else(|| std::env::var("ORT_DYLIB_PATH").ok());
+        let ort_load_timeout = std::time::Duration::from_secs(raw_config.embedder.load_timeout_secs.unwrap_or(30));
+        let embedder = onnx_dir
+            .and_then(|p| Embedder::load(Path::new(&p), ort_dylib.as_deref(), ort_load_timeout).ok())
             .map(Arc::new);
 
-        Ok(Self { db, vectors, embedder })
+        Ok(Self { db, vectors, embedder, fusion_defaults })
     }
 
     pub async fn search(
@@ -145,7 +167,7 @@ impl Searcher {
             SearchMode::Hybrid => {
                 hybrid_search(
                     query, opts.top_k, opts.candidate_pool, opts.tier, opts.max_per_file,
-                    ext, &self.vectors, &self.db, embedder?,
+                    ext, &self.vectors, &self.db, embedder?, self.fusion_defaults,
                 ).await
             }
             SearchMode::Dense => {
@@ -491,6 +513,7 @@ pub async fn hybrid_search(
     vectors:        &LanceStore,
     db:             &EnterpriseDb,
     embedder:       &Embedder,
+    fusion_defaults: FusionWeights,
 ) -> Result<Vec<SearchResult>, IndexerError> {
     // Use a deeper candidate pool for both channels so RRF has enough candidates to fuse
     let pool = candidate_pool.max(top_k);
@@ -506,7 +529,7 @@ pub async fn hybrid_search(
     // fused head (e.g. a path-boosted doc) would otherwise fill the top_k slots and
     // be cut down by the per-file cap afterwards, yielding far fewer than top_k
     // results and burying well-ranked candidates from other files.
-    let mut results = rrf_fuse(dense_res, sparse_res, query, FusionWeights::resolve());
+    let mut results = rrf_fuse(dense_res, sparse_res, query, FusionWeights::resolve(fusion_defaults));
     post_process(&mut results, max_per_file);
     results.truncate(top_k);
     Ok(results)

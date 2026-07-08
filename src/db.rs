@@ -198,6 +198,11 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_chunk);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_uri);
+
+CREATE TABLE IF NOT EXISTS index_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 // ── Transaction helper ────────────────────────────────────────────────────────
@@ -895,6 +900,37 @@ impl EnterpriseDb {
         Ok(results)
     }
 
+    // ── Index metadata ────────────────────────────────────────────────────────
+
+    /// Upsert a single-row-per-key metadata value (e.g. `embed_mode`). This is the
+    /// GLOBAL "how was this index built" signal, distinct from the per-row
+    /// `chunks.lance_id IS NULL` signal (which means "this chunk's embedding write
+    /// is still in flight/crashed mid-batch"). Conflating the two would be fragile:
+    /// a fully no-embed index and a genuinely crashed mid-flight index both look
+    /// like "all lance_id NULL" on a partial scan.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), IndexerError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO index_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, IndexerError> {
+        let conn = self.conn()?;
+        match conn.query_row(
+            "SELECT value FROM index_meta WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // ── Diagnostics ───────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<DbStats, IndexerError> {
@@ -1203,5 +1239,26 @@ mod tests {
 
         // Whitespace-only / empty input → sentinel empty phrase
         assert_eq!(EnterpriseDb::sanitize_fts_query("   "), "\"\"");
+    }
+
+    #[test]
+    fn set_and_get_meta_roundtrips() {
+        let (db, _dir) = open_test_db();
+        db.set_meta("embed_mode", "no_embed").unwrap();
+        assert_eq!(db.get_meta("embed_mode").unwrap(), Some("no_embed".to_string()));
+    }
+
+    #[test]
+    fn get_meta_missing_key_returns_none() {
+        let (db, _dir) = open_test_db();
+        assert!(db.get_meta("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_meta_upserts_on_conflict() {
+        let (db, _dir) = open_test_db();
+        db.set_meta("embed_mode", "enabled").unwrap();
+        db.set_meta("embed_mode", "no_embed").unwrap();
+        assert_eq!(db.get_meta("embed_mode").unwrap(), Some("no_embed".to_string()));
     }
 }

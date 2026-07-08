@@ -1,5 +1,6 @@
 mod chunker;
 mod chunker_map;
+mod config;
 mod db;
 mod error;
 mod indexer;
@@ -33,6 +34,15 @@ enum Command {
         /// Folder names to exclude (may be repeated, e.g. --exclude AppData --exclude .rustup)
         #[arg(long)]
         exclude: Vec<String>,
+        /// Build the index without embeddings (BM25/sparse-only). The mode is recorded
+        /// in the index so `search`/`score` report it. Without this flag, `index` hard-
+        /// errors when no embedder is configured — a corpus that "succeeds" with broken
+        /// dense search is exactly what this flag exists to make explicit.
+        #[arg(long)]
+        no_embed: bool,
+        /// Override the configured/default embed batch size for this run.
+        #[arg(long)]
+        embed_batch_size: Option<usize>,
     },
     /// Search the index
     Search {
@@ -149,8 +159,8 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Index { root, index_dir, reindex, exclude } => {
-            run_index(root, index_dir, reindex, exclude).await;
+        Command::Index { root, index_dir, reindex, exclude, no_embed, embed_batch_size } => {
+            run_index(root, index_dir, reindex, exclude, no_embed, embed_batch_size).await;
         }
         Command::Search {
             query, like, mode, top_k, candidate_pool, max_per_file,
@@ -182,7 +192,7 @@ async fn main() {
     }
 }
 
-async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Vec<String>) {
+async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Vec<String>, no_embed: bool, embed_batch_size: Option<usize>) {
     use crate::indexer::{IncrementalIndexer, Stats};
     use crate::storage::LocalStorageClient;
     use std::sync::Arc;
@@ -193,14 +203,27 @@ async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Ve
         tracing::info!("Excluding folders: {}", exclude.join(", "));
     }
 
-    let storage = Arc::new(LocalStorageClient::with_extra_ignores(exclude));
+    let raw_config = match crate::config::RawConfig::load(&index_dir) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("Error loading config: {}", e); std::process::exit(1); }
+    };
+    let extra_ignores: Vec<String> = exclude.into_iter()
+        .chain(raw_config.indexer.extra_ignore_dirs.clone().unwrap_or_default())
+        .collect();
+    let storage = Arc::new(LocalStorageClient::with_extra_ignores(extra_ignores));
 
     let t0 = std::time::Instant::now();
 
-    let indexer = match IncrementalIndexer::new(storage, &index_dir).await {
+    // `reindex` doubles as force_recreate permission for the destructive
+    // dim-mismatch vector-table rebuild — --reindex already means "wipe
+    // everything and rebuild", so this is consistent and avoids a second flag.
+    let mut indexer = match IncrementalIndexer::new(storage, &index_dir, reindex).await {
         Ok(i) => i,
-        Err(e) => { eprintln!("Error creating indexer: {}", e); return; }
+        Err(e) => { eprintln!("Error creating indexer: {}", e); std::process::exit(1); }
     };
+    if let Some(n) = embed_batch_size {
+        indexer.embed_batch_size = n;
+    }
 
     let root_str_for_start = root_str.clone();
     let on_start = move |total: usize| {
@@ -220,7 +243,7 @@ async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Ve
         );
     };
 
-    match indexer.index_root(&root_str, reindex, Some(&on_start), Some(&on_progress)).await {
+    match indexer.index_root(&root_str, reindex, no_embed, Some(&on_start), Some(&on_progress)).await {
         Ok(stats) => {
             println!();
             println!(
@@ -233,7 +256,7 @@ async fn run_index(root: PathBuf, index_dir: PathBuf, reindex: bool, exclude: Ve
             );
             println!("  {} vectors in index", fmt_num(stats.vec_total as i64));
         }
-        Err(e) => eprintln!("Indexing error: {}", e),
+        Err(e) => { eprintln!("Indexing error: {}", e); std::process::exit(1); }
     }
 }
 
@@ -273,10 +296,11 @@ async fn run_ingest(index_dir: PathBuf, batch: usize) {
     let batch = batch.max(1);
 
     // The push path never reads storage, but the constructor requires a backend.
+    // `force_recreate = false`: ingest never destroys the vector table.
     let storage = Arc::new(LocalStorageClient::with_extra_ignores(Vec::new()));
-    let indexer = match IncrementalIndexer::new(storage, &index_dir).await {
+    let indexer = match IncrementalIndexer::new(storage, &index_dir, false).await {
         Ok(i)  => i,
-        Err(e) => { eprintln!("Error creating indexer: {}", e); return; }
+        Err(e) => { eprintln!("Error creating indexer: {}", e); std::process::exit(1); }
     };
 
     let t0 = std::time::Instant::now();
@@ -284,13 +308,18 @@ async fn run_ingest(index_dir: PathBuf, batch: usize) {
     let mut malformed = 0usize;
     let mut line_no   = 0usize;
     let mut pending: Vec<IngestRecord> = Vec::with_capacity(batch);
+    let mut had_stdin_error = false;
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         line_no += 1;
         let line = match line {
             Ok(l)  => l,
-            Err(e) => { eprintln!("stdin read error at line {}: {}", line_no, e); break; }
+            Err(e) => {
+                eprintln!("stdin read error at line {}: {}", line_no, e);
+                had_stdin_error = true;
+                break;
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -313,7 +342,7 @@ async fn run_ingest(index_dir: PathBuf, batch: usize) {
                     totals.vec_total = s.vec_total;
                     pending.clear();
                 }
-                Err(e) => { eprintln!("Ingest error: {}", e); return; }
+                Err(e) => { eprintln!("Ingest error: {}", e); std::process::exit(1); }
             }
         }
     }
@@ -324,7 +353,7 @@ async fn run_ingest(index_dir: PathBuf, batch: usize) {
                 totals.errors   += s.errors;
                 totals.vec_total = s.vec_total;
             }
-            Err(e) => { eprintln!("Ingest error: {}", e); return; }
+            Err(e) => { eprintln!("Ingest error: {}", e); std::process::exit(1); }
         }
     }
 
@@ -336,6 +365,10 @@ async fn run_ingest(index_dir: PathBuf, batch: usize) {
         fmt_num(malformed       as i64),
     );
     println!("  {} vectors in index", fmt_num(totals.vec_total as i64));
+
+    if had_stdin_error {
+        std::process::exit(1);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -357,7 +390,7 @@ async fn run_search(
 
     let searcher = match Searcher::new(&index_dir).await {
         Ok(s) => s,
-        Err(e) => { eprintln!("Error opening index: {}", e); return; }
+        Err(e) => { eprintln!("Error opening index: {}", e); std::process::exit(1); }
     };
 
     if stats {
@@ -395,7 +428,7 @@ async fn run_search(
                 println!("  {:>10}  FTS docs", fmt_num(s.db_stats.chunks_fts_docs));
                 println!("  {:>10}  vectors",  fmt_num(s.vec_total as i64));
             }
-            Err(e) => eprintln!("Stats error: {}", e),
+            Err(e) => { eprintln!("Stats error: {}", e); std::process::exit(1); }
         }
         return;
     }
@@ -407,9 +440,23 @@ async fn run_search(
     };
 
     // Auto-fallback: if the embedder is not available, dense/hybrid silently degrade
-    // into a hard error. Warn the user and switch to sparse instead.
+    // into a hard error. Warn the user and switch to sparse instead. Distinguish a
+    // corpus that was deliberately built with --no-embed (recorded embed_mode) from
+    // an ambiguous missing-embedder situation, so the message tells the user whether
+    // this is expected or something to fix.
     if searcher.embedder.is_none() && mode != SearchMode::Sparse && like.is_none() {
-        eprintln!("warning: NOMIC_ONNX_PATH not set — falling back to sparse (FTS5) search");
+        let embed_mode = searcher.db.get_meta("embed_mode").unwrap_or(None);
+        match embed_mode.as_deref() {
+            Some("no_embed") => eprintln!(
+                "note: this index was built with --no-embed (embed_mode=no_embed recorded) — no dense \
+                 vectors exist; falling back to sparse (FTS5) search"
+            ),
+            _ => eprintln!(
+                "warning: no embedder available (NOMIC_ONNX_PATH not set or failed to load) — falling \
+                 back to sparse (FTS5) search. If this index's chunks were meant to be embedded, dense \
+                 results will be missing until the embedder is fixed and the index is rebuilt or rechecked."
+            ),
+        }
         mode = SearchMode::Sparse;
     }
 
@@ -441,20 +488,20 @@ async fn run_search(
     let results = if let Some(ref like_path) = like {
         if query.is_some() {
             eprintln!("Error: --like and a text query are mutually exclusive.");
-            return;
+            std::process::exit(1);
         }
         match searcher.search_like(like_path, opts).await {
             Ok(r) => r,
-            Err(e) => { eprintln!("Search error: {}", e); return; }
+            Err(e) => { eprintln!("Search error: {}", e); std::process::exit(1); }
         }
     } else {
         let q = match query {
             Some(q) => q,
-            None    => { eprintln!("Provide a query, --like <path>, or --stats"); return; }
+            None    => { eprintln!("Provide a query, --like <path>, or --stats"); std::process::exit(1); }
         };
         match searcher.search(&q, opts).await {
             Ok(r) => r,
-            Err(e) => { eprintln!("Search error: {}", e); return; }
+            Err(e) => { eprintln!("Search error: {}", e); std::process::exit(1); }
         }
     };
 
@@ -624,16 +671,16 @@ async fn run_explain(path: PathBuf, index_dir: PathBuf, all_chunks: bool) {
 
     let searcher = match Searcher::new(&index_dir).await {
         Ok(s) => s,
-        Err(e) => { eprintln!("Error opening index: {}", e); return; }
+        Err(e) => { eprintln!("Error opening index: {}", e); std::process::exit(1); }
     };
 
     let data = match searcher.explain_full(&path) {
         Ok(Some(d)) => d,
         Ok(None) => {
             eprintln!("No entry found for '{}'. The file may not be indexed.", path.display());
-            return;
+            std::process::exit(1);
         }
-        Err(e) => { eprintln!("Explain error: {}", e); return; }
+        Err(e) => { eprintln!("Explain error: {}", e); std::process::exit(1); }
     };
 
     let lossy    = path.to_string_lossy();
@@ -725,12 +772,13 @@ async fn run_tui(index_dir: PathBuf, root: Option<PathBuf>) {
 
     let searcher = match Searcher::new(&index_dir).await {
         Ok(s) => s,
-        Err(e) => { eprintln!("Error opening index: {}", e); return; }
+        Err(e) => { eprintln!("Error opening index: {}", e); std::process::exit(1); }
     };
 
     let mut app = tui::App::new(searcher, index_dir, root);
     if let Err(e) = app.run().await {
         eprintln!("TUI error: {}", e);
+        std::process::exit(1);
     }
 }
 
@@ -740,8 +788,17 @@ async fn run_score(index_dir: PathBuf, rescore: bool) {
 
     let searcher = match Searcher::new(&index_dir).await {
         Ok(s)  => s,
-        Err(e) => { eprintln!("Error opening index: {}", e); return; }
+        Err(e) => { eprintln!("Error opening index: {}", e); std::process::exit(1); }
     };
+
+    if let Ok(Some(mode)) = searcher.db.get_meta("embed_mode") {
+        if mode == "no_embed" {
+            println!(
+                "note: this index's recorded embed_mode is 'no_embed' — coherence scores will be \
+                 unavailable for every chunk (no lance_id), only structural scores apply."
+            );
+        }
+    }
 
     match score_all(&searcher.db, &searcher.vectors, rescore, None).await {
         Ok(s) => println!(
@@ -752,7 +809,7 @@ async fn run_score(index_dir: PathBuf, rescore: bool) {
             fmt_num(s.coherence_only  as i64),
             fmt_num(s.both            as i64),
         ),
-        Err(e) => eprintln!("Score error: {}", e),
+        Err(e) => { eprintln!("Score error: {}", e); std::process::exit(1); }
     }
 }
 
@@ -766,12 +823,12 @@ async fn run_scores_show(
 
     let searcher = match Searcher::new(&index_dir).await {
         Ok(s)  => s,
-        Err(e) => { eprintln!("Error opening index: {}", e); return; }
+        Err(e) => { eprintln!("Error opening index: {}", e); std::process::exit(1); }
     };
 
     let chunks = match searcher.db.get_scored_chunks(limit, flagged_only, tier) {
         Ok(c)  => c,
-        Err(e) => { eprintln!("Error reading scores: {}", e); return; }
+        Err(e) => { eprintln!("Error reading scores: {}", e); std::process::exit(1); }
     };
 
     if chunks.is_empty() {
@@ -848,18 +905,19 @@ async fn run_recheck(index_dir: PathBuf, dry_run: bool) {
 
     let map = match ChunkerMap::load_or_create(&index_dir) {
         Ok(m)  => m,
-        Err(e) => { eprintln!("Error loading chunker map: {}", e); return; }
+        Err(e) => { eprintln!("Error loading chunker map: {}", e); std::process::exit(1); }
     };
 
+    // `force_recreate = false`: recheck never destroys the vector table.
     let storage = Arc::new(LocalStorageClient::new());
-    let indexer = match IncrementalIndexer::new(storage, &index_dir).await {
+    let indexer = match IncrementalIndexer::new(storage, &index_dir, false).await {
         Ok(i)  => i,
-        Err(e) => { eprintln!("Error opening index: {}", e); return; }
+        Err(e) => { eprintln!("Error opening index: {}", e); std::process::exit(1); }
     };
 
     let flagged = match indexer.db.get_flagged_files_with_methods() {
         Ok(f)  => f,
-        Err(e) => { eprintln!("Error querying flagged files: {}", e); return; }
+        Err(e) => { eprintln!("Error querying flagged files: {}", e); std::process::exit(1); }
     };
 
     if flagged.is_empty() {
@@ -949,7 +1007,7 @@ async fn run_recheck(index_dir: PathBuf, dry_run: bool) {
                 );
             }
         }
-        Err(e) => { eprintln!("Reindex error: {}", e); return; }
+        Err(e) => { eprintln!("Reindex error: {}", e); std::process::exit(1); }
     }
 
     println!(
