@@ -22,25 +22,38 @@ pub const RRF_SPARSE_WEIGHT: f64 = 0.4;
 /// for is a strong relevance signal, so we add a bounded bonus proportional to how
 /// much of the file's basename the query covers. Scaled to one rank-1 RRF channel.
 pub const PATH_BOOST_WEIGHT: f64 = 1.5;
+/// Weight for the trigram fuzzy channel. The trigram index matches overlapping
+/// 3-grams, so it recovers typo'd query tokens the porter channel (exact stemmed
+/// match) and the dense channel both miss. It only fires on query tokens the porter
+/// index can't match (see `trigram_search_oov`) — a global trigram channel just
+/// injected noise and regressed clean queries (mutation sweep: 4.75→4.69), whereas
+/// the OOV-scoped channel rescues typo misses without touching clean queries
+/// (4.75→4.81, +1 typo top-10, +1 fully-robust on the union corpus). It is still
+/// low-precision, so it rides at a low weight. The win is flat across [0.2, 0.5] and
+/// decays back to baseline by 1.0; 0.3 sits at the centre of the validated band.
+pub const RRF_TRIGRAM_WEIGHT: f64 = 0.3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FusionWeights {
-    pub dense:  f64,
-    pub sparse: f64,
-    pub path:   f64,
+    pub dense:   f64,
+    pub sparse:  f64,
+    pub path:    f64,
+    pub trigram: f64,
 }
 
 impl FusionWeights {
     /// Resolve weights, allowing env overrides for tuning sweeps without a rebuild
-    /// (`RRF_DENSE_WEIGHT` / `RRF_SPARSE_WEIGHT` / `PATH_BOOST_WEIGHT`).
+    /// (`RRF_DENSE_WEIGHT` / `RRF_SPARSE_WEIGHT` / `PATH_BOOST_WEIGHT` /
+    /// `RRF_TRIGRAM_WEIGHT`).
     fn resolve() -> Self {
         let parse = |k: &str, default: f64| {
             std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(default)
         };
         Self {
-            dense:  parse("RRF_DENSE_WEIGHT",  RRF_DENSE_WEIGHT),
-            sparse: parse("RRF_SPARSE_WEIGHT", RRF_SPARSE_WEIGHT),
-            path:   parse("PATH_BOOST_WEIGHT", PATH_BOOST_WEIGHT),
+            dense:   parse("RRF_DENSE_WEIGHT",   RRF_DENSE_WEIGHT),
+            sparse:  parse("RRF_SPARSE_WEIGHT",  RRF_SPARSE_WEIGHT),
+            path:    parse("PATH_BOOST_WEIGHT",  PATH_BOOST_WEIGHT),
+            trigram: parse("RRF_TRIGRAM_WEIGHT", RRF_TRIGRAM_WEIGHT),
         }
     }
 }
@@ -435,11 +448,30 @@ pub fn sparse_search(
     }
     fts.truncate(top_k);
 
-    let mut results: Vec<SearchResult> = fts
-        .into_iter()
+    let mut results = fts_to_results(fts);
+
+    // Normalize: best BM25 result (most negative) maps to 1.0
+    let max_abs = results
+        .iter()
+        .filter_map(|r| r.sparse_score)
+        .map(|s| s.abs())
+        .fold(f64::MIN_POSITIVE, f64::max);
+    for r in &mut results {
+        r.normalized_score = r.sparse_score.map(|s| s.abs() / max_abs).unwrap_or(0.0);
+    }
+
+    Ok(results)
+}
+
+/// Map ranked `FtsResult`s (from either the porter or trigram FTS5 index) into
+/// `SearchResult`s, recording 1-based rank in `sparse_rank` and the BM25 score in
+/// `sparse_score`. `normalized_score` is left at 0.0 — RRF recomputes it from the
+/// fused `rrf_score`.
+fn fts_to_results(fts: Vec<FtsResult>) -> Vec<SearchResult> {
+    fts.into_iter()
         .enumerate()
         .map(|(i, r)| SearchResult {
-            chunk_id:         r.id,
+            chunk_id: r.id,
             chunk: ChunkRow {
                 id:               r.id,
                 file_id:          r.file_id,
@@ -463,19 +495,33 @@ pub fn sparse_search(
             sparse_rank:      Some(i + 1),
             normalized_score: 0.0,
         })
-        .collect();
+        .collect()
+}
 
-    // Normalize: best BM25 result (most negative) maps to 1.0
-    let max_abs = results
-        .iter()
-        .filter_map(|r| r.sparse_score)
-        .map(|s| s.abs())
-        .fold(f64::MIN_POSITIVE, f64::max);
-    for r in &mut results {
-        r.normalized_score = r.sparse_score.map(|s| s.abs() / max_abs).unwrap_or(0.0);
+/// Trigram fuzzy channel: query the overlapping-3-gram FTS5 index so typo'd or
+/// truncated query tokens still surface the right chunk. Low precision by design —
+/// fused at a low weight in `rrf_fuse`. Returns ranked `SearchResult`s (best first).
+pub fn trigram_search(
+    query:      &str,
+    top_k:      usize,
+    tier:       Option<u8>,
+    ext_filter: Option<&str>,
+    db:         &EnterpriseDb,
+) -> Result<Vec<SearchResult>, IndexerError> {
+    // OOV-scoped: only query tokens the porter channel can't match reach the trigram
+    // index, so this fuzzy channel stays silent on clean queries (where it only added
+    // noise) and fires just on genuine typo/OOV terms.
+    let mut fts: Vec<FtsResult> = db.trigram_search_oov(query, top_k * 2)?;
+
+    if let Some(t) = tier {
+        fts.retain(|r| r.tier == t);
     }
+    if ext_filter.is_some() {
+        fts.retain(|r| matches_ext(&r.file_uri, ext_filter));
+    }
+    fts.truncate(top_k);
 
-    Ok(results)
+    Ok(fts_to_results(fts))
 }
 
 // ── Hybrid search (RRF) ───────────────────────────────────────────────────────
@@ -498,15 +544,17 @@ pub async fn hybrid_search(
     // Degrade gracefully: a sparse (FTS5) error or empty result must NOT discard the
     // dense channel. Fall back to dense-only fusion instead of aborting the whole query
     // (Defect 5 — `?` here previously zeroed out hybrid on any FTS5 syntax error).
-    let sparse_res = sparse_search(query, pool, tier, ext_filter, db).unwrap_or_default();
-    let dense_res  = dense_fut.await?;
+    let sparse_res  = sparse_search(query, pool, tier, ext_filter, db).unwrap_or_default();
+    // Trigram is a best-effort fuzzy rescue channel — never let it abort the query.
+    let trigram_res = trigram_search(query, pool, tier, ext_filter, db).unwrap_or_default();
+    let dense_res   = dense_fut.await?;
 
     // Fuse the full candidate pool, then cap-per-file, *then* truncate to top_k.
     // Capping before truncation is essential: a single file whose chunks flood the
     // fused head (e.g. a path-boosted doc) would otherwise fill the top_k slots and
     // be cut down by the per-file cap afterwards, yielding far fewer than top_k
     // results and burying well-ranked candidates from other files.
-    let mut results = rrf_fuse(dense_res, sparse_res, query, FusionWeights::resolve());
+    let mut results = rrf_fuse(dense_res, sparse_res, trigram_res, query, FusionWeights::resolve());
     post_process(&mut results, max_per_file);
     results.truncate(top_k);
     Ok(results)
@@ -551,10 +599,12 @@ fn post_process(results: &mut Vec<SearchResult>, max_per_file: usize) {
 pub fn rrf_fuse(
     dense:   Vec<SearchResult>,
     sparse:  Vec<SearchResult>,
+    trigram: Vec<SearchResult>,
     query:   &str,
     weights: FusionWeights,
 ) -> Vec<SearchResult> {
-    let FusionWeights { dense: w_dense, sparse: w_sparse, path: w_path } = weights;
+    let FusionWeights { dense: w_dense, sparse: w_sparse, path: w_path, trigram: w_trigram } =
+        weights;
     let mut scores: HashMap<i64, f64>         = HashMap::new();
     let mut merged: HashMap<i64, SearchResult> = HashMap::new();
 
@@ -583,6 +633,20 @@ pub fn rrf_fuse(
             });
     }
 
+    // Trigram fuzzy channel: same rank-based RRF contribution as sparse, but at a
+    // lower weight. A trigram-only hit (typo the other channels missed entirely) is
+    // inserted into `merged` so it can surface; it reuses the sparse_* display fields.
+    for (rank, r) in trigram.into_iter().enumerate() {
+        let rank1 = rank + 1;
+        let delta = w_trigram / (RRF_K + rank1 as f64);
+        scores.entry(r.chunk_id).and_modify(|v| *v += delta).or_insert(delta);
+        merged.entry(r.chunk_id).or_insert_with(|| {
+            let mut nr = r;
+            nr.sparse_rank = nr.sparse_rank.or(Some(rank1));
+            nr
+        });
+    }
+
     // Apply accumulated RRF scores, plus a filename/path-token bonus so a file
     // named after what the query asks for can climb out from under prose docs that
     // merely describe the same concept (M8) and so literal basename lookups surface
@@ -608,9 +672,9 @@ pub fn rrf_fuse(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Normalize: theoretical max is rank-1 in both weighted channels plus a full
-    // filename match — (w_dense + w_sparse + w_path) / (k+1).
-    let rrf_max = (w_dense + w_sparse + w_path) / (RRF_K + 1.0);
+    // Normalize: theoretical max is rank-1 in every weighted channel plus a full
+    // filename match — (w_dense + w_sparse + w_trigram + w_path) / (k+1).
+    let rrf_max = (w_dense + w_sparse + w_trigram + w_path) / (RRF_K + 1.0);
     for r in &mut results {
         r.normalized_score = r.rrf_score.map(|s| (s / rrf_max).clamp(0.0, 1.0)).unwrap_or(0.0);
     }
@@ -732,8 +796,8 @@ mod tests {
         let mut code = make_result(2, 1, Some(5), None);       // rank-5 code, name matches
         code.chunk.file_uri = "C:\\x\\src\\incremental_indexer.py".to_string();
 
-        let weights = FusionWeights { dense: 1.0, sparse: 0.4, path: 1.5 };
-        let results = rrf_fuse(vec![doc, code], vec![], "incremental indexer drift", weights);
+        let weights = FusionWeights { dense: 1.0, sparse: 0.4, path: 1.5, trigram: 0.0 };
+        let results = rrf_fuse(vec![doc, code], vec![], vec![], "incremental indexer drift", weights);
         assert_eq!(results[0].chunk_id, 2, "name-matching code file should rank first");
     }
 
@@ -742,7 +806,7 @@ mod tests {
         // Rank-1 item from a single channel should score 1/(60+1)
         let dense  = vec![make_result(1, 1, Some(1), None)];
         let sparse = vec![];
-        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
+        let results = rrf_fuse(dense, sparse, vec![], "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0, trigram: 0.0 });
         assert_eq!(results.len(), 1);
         let score = results[0].rrf_score.unwrap();
         let expected = 1.0 / (RRF_K + 1.0);
@@ -750,11 +814,28 @@ mod tests {
     }
 
     #[test]
+    fn rrf_fuse_surfaces_trigram_only_hit() {
+        // A chunk found by neither dense nor sparse, only the trigram channel (the
+        // typo-recovery case), must still surface in the fused output.
+        let dense   = vec![make_result(1, 1, Some(1), None)];
+        let sparse  = vec![];
+        let trigram = vec![make_result(99, 1, None, None)];
+        let results = rrf_fuse(dense, sparse, trigram, "",
+            FusionWeights { dense: 1.0, sparse: 0.4, path: 0.0, trigram: 0.2 });
+        assert!(results.iter().any(|r| r.chunk_id == 99),
+            "trigram-only candidate must appear in fused results");
+        // But it ranks below the dense rank-1 hit (trigram is the low-weight channel).
+        let pos_dense = results.iter().position(|r| r.chunk_id == 1).unwrap();
+        let pos_tri   = results.iter().position(|r| r.chunk_id == 99).unwrap();
+        assert!(pos_dense < pos_tri, "low-weight trigram hit should rank below dense rank-1");
+    }
+
+    #[test]
     fn rrf_fuse_deduplicates() {
         // Same chunk_id appearing in both channels should appear once
         let dense  = vec![make_result(42, 1, Some(1), None)];
         let sparse = vec![make_result(42, 1, None, Some(1))];
-        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
+        let results = rrf_fuse(dense, sparse, vec![], "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0, trigram: 0.0 });
         assert_eq!(results.len(), 1, "deduplication failed");
         assert_eq!(results[0].chunk_id, 42);
     }
@@ -772,7 +853,7 @@ mod tests {
             make_result(single_id, 1, None, Some(2)),
         ];
 
-        let mut results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
+        let mut results = rrf_fuse(dense, sparse, vec![], "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0, trigram: 0.0 });
         results.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap());
 
         // both_id (rank-1 dense + rank-1 sparse) should outscore single_id (rank-2 sparse only)
@@ -791,7 +872,7 @@ mod tests {
             .map(|i| make_result(i, 1, Some(i as usize), None))
             .collect();
         let sparse: Vec<SearchResult> = vec![];
-        let mut fused = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
+        let mut fused = rrf_fuse(dense, sparse, vec![], "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0, trigram: 0.0 });
         assert_eq!(fused.len(), n, "rrf_fuse should return all candidates, not truncate");
         let sorted = fused.windows(2).all(|w| w[0].rrf_score >= w[1].rrf_score);
         assert!(sorted, "results must be sorted by descending score");
@@ -806,7 +887,7 @@ mod tests {
         // Results from rrf_fuse with empty sparse have no sparse_score
         let dense  = vec![make_result(1, 1, Some(1), None)];
         let sparse = vec![];
-        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
+        let results = rrf_fuse(dense, sparse, vec![], "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0, trigram: 0.0 });
         assert_eq!(results.len(), 1);
         assert!(results[0].sparse_score.is_none(), "dense-only result should have no sparse_score");
         assert!(results[0].dense_score.is_some(),  "dense-only result should have dense_score");
@@ -816,7 +897,7 @@ mod tests {
     fn sparse_only_mode_no_dense() {
         let dense  = vec![];
         let sparse = vec![make_result(1, 1, None, Some(1))];
-        let results = rrf_fuse(dense, sparse, "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0 });
+        let results = rrf_fuse(dense, sparse, vec![], "", FusionWeights { dense: 1.0, sparse: 1.0, path: 0.0, trigram: 0.0 });
         assert_eq!(results.len(), 1);
         assert!(results[0].dense_score.is_none(),  "sparse-only result should have no dense_score");
         assert!(results[0].sparse_score.is_some(), "sparse-only result should have sparse_score");
