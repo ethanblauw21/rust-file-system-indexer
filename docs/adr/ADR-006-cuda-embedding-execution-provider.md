@@ -1,7 +1,7 @@
 # ADR-006: CUDA Execution Provider for the Embedding Phase (opt-in, throughput-gated)
 
-**Status:** Proposed
-**Date:** 2026-07-08
+**Status:** Accepted
+**Date:** 2026-07-08 (accepted 2026-07-09)
 **Deciders:** Ethan
 **Depends on:** none
 **Required by:** none yet
@@ -196,7 +196,7 @@ explicitly so the divergence from the ranking-ADR discipline is auditable, not a
 - [x] Phase 3 — re-profiled CUDA path: inference 97% → 58.7%; bottleneck relocating to lance_write (15%) / ivf_build (9.5%) / tokenize (8.5%) / chunking (7.1%). Next perf target is IO/LanceDB + IVF, not tokenization alone — propose as a follow-up, not scoped here.
 - [x] Task 5 — before/after recorded (Evidence): **24.9× end-to-end**, inference 39.4×, on the same corpus at steady state, git-SHA stamped.
 - [x] Confirm CPU-default build + `cargo test` still pass (non-GPU CI green) — Phase 1/2 changes keep the default build clean + clippy `-D warnings`.
-- [ ] Set status **Accepted** on merge (PR); no **Required by** obligations exist.
+- [x] Config path validated as shipped: `NOMIC_ONNX_FILE=model_fp16.onnx` loads the fp16 export and runs on GPU (no rename hack). Status set **Accepted**; no **Required by** obligations exist.
 
 **Notes:**
 <!-- 2026-07-08: ADR opened Proposed. Conditional on Phase-0 profile. -->
