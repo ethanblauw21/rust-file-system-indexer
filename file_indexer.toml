@@ -38,6 +38,15 @@
 # sparse (FTS5)-only and prints a warning naming which case it hit.
 # onnx_model_dir = "C:/models/nomic-embed-text-v1.5"
 
+# ONNX model filename within onnx_model_dir. Default: nomic-embed-text-v1.5.onnx
+# (int8-quantized). Falls back to the NOMIC_ONNX_FILE environment variable when
+# unset here. Set to an fp16 export (e.g. "model_fp16.onnx") for the CUDA/GPU
+# build (--features cuda) — the default int8 export forces ~156 CPU-fallback
+# memcpy nodes on the CUDA execution provider and runs ~20x slower than the
+# fp16 export, which stays on-GPU/tensor-core (ADR-006). The tokenizer file
+# (tokenizer.json) is fixed and shared across precisions.
+# onnx_model_file = "model_fp16.onnx"
+
 # Path to the ONNX Runtime shared library (onnxruntime.dll / .so / .dylib).
 # Falls back to the ORT_DYLIB_PATH environment variable when unset here.
 # A version-mismatched dylib doesn't error — it can hang inside the native

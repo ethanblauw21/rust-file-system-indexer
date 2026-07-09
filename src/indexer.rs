@@ -481,15 +481,20 @@ impl Embedder {
     /// it can hang indefinitely inside the native `GetApi()` call (see dogfood doc
     /// Defect 1), which would otherwise wedge the whole `index`/`search` command
     /// with no diagnostic. `ort_dylib_path` overrides `ORT_DYLIB_PATH` when set.
+    /// `model_file` names the ONNX file within `onnx_dir` (e.g.
+    /// `nomic-embed-text-v1.5.onnx` or, for the CUDA EP, `model_fp16.onnx` —
+    /// see ADR-006). The tokenizer filename is always `tokenizer.json`.
     pub fn load(
         onnx_dir: &Path,
+        model_file: &str,
         ort_dylib_path: Option<&str>,
         load_timeout: std::time::Duration,
     ) -> Result<Self, IndexerError> {
         let onnx_dir = onnx_dir.to_path_buf();
+        let model_file = model_file.to_string();
         let ort_dylib_path = ort_dylib_path.map(str::to_string);
         run_with_timeout(load_timeout, move || {
-            Self::load_inner(&onnx_dir, ort_dylib_path.as_deref())
+            Self::load_inner(&onnx_dir, &model_file, ort_dylib_path.as_deref())
         })
     }
 
@@ -507,10 +512,10 @@ impl Embedder {
     /// is gated on (see docs/adr/ADR-006-cuda-embedding-execution-provider.md),
     /// so a CUDA registration failure must surface as a named
     /// `IndexerError::Embedding`, never a quiet no-op.
-    fn load_inner(onnx_dir: &Path, ort_dylib_path: Option<&str>) -> Result<Self, IndexerError> {
+    fn load_inner(onnx_dir: &Path, model_file: &str, ort_dylib_path: Option<&str>) -> Result<Self, IndexerError> {
         use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 
-        let model_path = onnx_dir.join("nomic-embed-text-v1.5.onnx");
+        let model_path = onnx_dir.join(model_file);
         let tok_path   = onnx_dir.join("tokenizer.json");
 
         let ort_dll = ort_dylib_path.map(str::to_string)
@@ -878,13 +883,16 @@ impl IncrementalIndexer {
 
         let onnx_dir = raw_config.embedder.onnx_model_dir.clone()
             .or_else(|| std::env::var("NOMIC_ONNX_PATH").ok());
+        let onnx_model_file = raw_config.embedder.onnx_model_file.clone()
+            .or_else(|| std::env::var("NOMIC_ONNX_FILE").ok())
+            .unwrap_or_else(|| "nomic-embed-text-v1.5.onnx".to_string());
         let ort_dylib = raw_config.embedder.ort_dylib_path.clone()
             .or_else(|| std::env::var("ORT_DYLIB_PATH").ok());
         let ort_load_timeout = std::time::Duration::from_secs(
             raw_config.embedder.load_timeout_secs.unwrap_or(30)
         );
         let embedder = onnx_dir
-            .and_then(|p| Embedder::load(Path::new(&p), ort_dylib.as_deref(), ort_load_timeout).ok())
+            .and_then(|p| Embedder::load(Path::new(&p), &onnx_model_file, ort_dylib.as_deref(), ort_load_timeout).ok())
             .map(Arc::new);
 
         Ok(Self {
@@ -1456,7 +1464,8 @@ mod tests {
 
     fn load_embedder() -> Option<Embedder> {
         let path = std::env::var("NOMIC_ONNX_PATH").ok()?;
-        Embedder::load(Path::new(&path), None, std::time::Duration::from_secs(30)).ok()
+        let model_file = std::env::var("NOMIC_ONNX_FILE").unwrap_or_else(|_| "nomic-embed-text-v1.5.onnx".into());
+        Embedder::load(Path::new(&path), &model_file, None, std::time::Duration::from_secs(30)).ok()
     }
 
     #[test]
@@ -1504,7 +1513,8 @@ mod tests {
             Ok(p) => p,
             Err(_) => { println!("SKIP: NOMIC_ONNX_PATH not set"); return; }
         };
-        let embedder = match Embedder::load(Path::new(&path), None, std::time::Duration::from_secs(30)) {
+        let model_file = std::env::var("NOMIC_ONNX_FILE").unwrap_or_else(|_| "nomic-embed-text-v1.5.onnx".into());
+        let embedder = match Embedder::load(Path::new(&path), &model_file, None, std::time::Duration::from_secs(30)) {
             Ok(e) => e,
             Err(e) => { println!("SKIP: CUDA embedder failed to load ({e}); GPU runtime likely absent"); return; }
         };
