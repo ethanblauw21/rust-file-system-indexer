@@ -82,6 +82,58 @@ your OS/arch and Microsoft's release page is the authoritative source for that U
 
 > **Note:** The ONNX model files and indexed data are not included in this repository due to size.
 
+### GPU acceleration (CUDA, optional)
+
+The embedding phase is the indexing bottleneck (inference ≈ 97% of the work — see
+`docs/adr/ADR-006-cuda-embedding-execution-provider.md`). Building with the **`cuda`** feature
+registers ONNX Runtime's CUDA execution provider and, on the reference machine (NVIDIA RTX PRO 1000,
+8 GB), cut a full-corpus index from **1h16m to 3m5s — a measured 24.9× end-to-end** (inference alone
+39×). CUDA is **opt-in and never the default**: the CPU build stays portable and CI without a GPU is
+unaffected.
+
+```bash
+cargo build --release --features cuda
+```
+
+`--features cuda` compiles **without** a CUDA toolkit (the provider loads at runtime via
+`load-dynamic`). To actually run on the GPU you need four things, all matched to onnxruntime **1.24.x**:
+
+| # | What | Exact requirement |
+|---|------|--------------------|
+| 1 | **GPU** onnxruntime build | `onnxruntime-win-x64-gpu-1.24.2` (ships `onnxruntime_providers_cuda.dll`) — the CPU-only build has no CUDA provider |
+| 2 | CUDA runtime | **CUDA 12.x** (validated with 12.9) — `cudart`, `cublas`, `cublasLt`, `cufft`, `nvrtc` |
+| 3 | cuDNN | **cuDNN 9.x** (validated with 9.24) |
+| 4 | **fp16 model** | `model_fp16.onnx` from the Hugging Face repo — **do not use the default int8 export on the GPU** |
+
+**The fp16 model is not optional on the GPU.** The default `nomic-embed-text-v1.5.onnx` is
+int8-quantized; ONNX Runtime's CUDA EP can't run its quant ops and inserts ~156 CPU↔GPU memcpy nodes,
+making the GPU path *slower than CPU*. The fp16 export (`model_fp16.onnx`, same weights) runs on-GPU
+with tensor cores and is **more** faithful than int8 (cosine 1.0 vs fp32, vs int8's 0.96). Select it
+via the configurable model filename:
+
+```toml
+[embedder]
+onnx_model_dir  = "C:/models/nomic"     # dir holding model_fp16.onnx + tokenizer.json
+onnx_model_file = "model_fp16.onnx"     # default is nomic-embed-text-v1.5.onnx (int8) — override for GPU
+ort_dylib_path  = "C:/onnxruntime-gpu/lib/onnxruntime.dll"   # the GPU build's dll
+```
+
+(or the `NOMIC_ONNX_FILE` env var, same precedence as `NOMIC_ONNX_PATH`.) Ensure the GPU build's
+`lib/` directory — with the CUDA/cuDNN DLLs beside `onnxruntime.dll` — is on `PATH` so the provider's
+dependencies resolve.
+
+**No-admin toolchain (what the reference setup used):** rather than the CUDA Toolkit + cuDNN
+installers, the CUDA 12.x / cuDNN 9.x runtime DLLs can be pulled from pip wheels
+(`nvidia-cuda-runtime-cu12`, `nvidia-cublas-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`,
+`nvidia-cuda-nvrtc-cu12`, `nvidia-cudnn-cu12>=9,<10`) and copied next to the GPU `onnxruntime.dll`.
+
+A `--features cuda` build that can't initialize CUDA (missing/mismatched runtime) **fails loud** with a
+named `IndexerError::Embedding` within the load timeout — it never silently falls back to CPU (which
+would corrupt a throughput comparison). Batch size stays at the default **32** (the throughput-optimal
+value for this model on an 8 GB GPU — larger batches waste O(seq²) compute on padding; tune via
+`--embed-batch-size` if needed). Because fp16-GPU and int8-CPU vectors differ by ~0.96 cosine, build a
+given index with **one** precision throughout.
+
 ## Usage
 
 ```bash
