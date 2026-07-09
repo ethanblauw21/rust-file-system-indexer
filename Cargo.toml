@@ -71,6 +71,10 @@ toml = { version = "0.8", features = ["preserve_order"] }
 tempfile = "3"
 rust_xlsxwriter = "0.78"    # creates in-memory XLSX for chunker tests
 
+# ── ADR-006 Phase 1 (opt-in CUDA execution provider) ─────────────────────────
+[features]
+cuda = ["ort/cuda"]
+
 [profile.release]
 opt-level     = 3
 lto           = "thin"

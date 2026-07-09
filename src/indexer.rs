@@ -493,6 +493,20 @@ impl Embedder {
         })
     }
 
+    /// ADR-006 Phase 1: when built with `--features cuda`, this registers the
+    /// ONNX Runtime CUDA execution provider on the `SessionBuilder` before the
+    /// CPU-only fallback path would otherwise run. Registration happens INSIDE
+    /// `load_inner`, which `load` already wraps in `run_with_timeout`, so a
+    /// CUDA init hang (missing driver, mismatched CUDA/cuDNN) is bounded by the
+    /// same load timeout as the existing ORT-DLL-version defect instead of
+    /// wedging indefinitely.
+    ///
+    /// `.error_on_failure()` is deliberate: `ort`'s default is to *silently*
+    /// fall back to CPU if EP registration fails. A `cuda`-featured build that
+    /// secretly ran on CPU would corrupt the throughput measurement this ADR
+    /// is gated on (see docs/adr/ADR-006-cuda-embedding-execution-provider.md),
+    /// so a CUDA registration failure must surface as a named
+    /// `IndexerError::Embedding`, never a quiet no-op.
     fn load_inner(onnx_dir: &Path, ort_dylib_path: Option<&str>) -> Result<Self, IndexerError> {
         use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 
@@ -506,10 +520,25 @@ impl Embedder {
             .map_err(|e| IndexerError::Embedding(format!("ORT DLL load failed: {e}")))?
             .commit();
 
-        let session = SessionBuilder::new()
+        #[allow(unused_mut)] // `mut` is only exercised by with_execution_providers under --features cuda
+        let mut builder = SessionBuilder::new()
             .map_err(|e| IndexerError::Embedding(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| IndexerError::Embedding(e.to_string()))?
+            .map_err(|e| IndexerError::Embedding(e.to_string()))?;
+
+        #[cfg(feature = "cuda")]
+        {
+            builder = builder
+                .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+                .map_err(|e| IndexerError::Embedding(format!(
+                    "CUDA execution provider failed to register (built with --features cuda). \
+                     Likely cause: missing/mismatched GPU onnxruntime build (need \
+                     onnxruntime_providers_cuda.dll for onnxruntime 1.24.x / ort 2.0.0-rc.12), CUDA \
+                     Toolkit 12.x, or cuDNN 9.x on PATH/ORT_DYLIB_PATH dir. Underlying error: {e}"
+                )))?;
+        }
+
+        let session = builder
             .commit_from_file(&model_path)
             .map_err(|e| IndexerError::Embedding(e.to_string()))?;
 
@@ -1460,6 +1489,30 @@ mod tests {
             let cosine: f32 = batch.row(i).dot(&single.row(0));
             assert!(cosine > 0.95, "batch vs single cosine similarity too low for '{}': {}", t, cosine);
         }
+    }
+
+    /// ADR-006 Phase 1: compile-only on the default build (gated behind
+    /// `--features cuda`); auto-skips at runtime when there's no GPU/CUDA
+    /// toolkit present, mirroring `load_embedder`'s skip pattern above. This
+    /// machine has no CUDA Toolkit/cuDNN installed, so `Embedder::load` is
+    /// expected to error here — the skip path, not the assertion path, is
+    /// what actually runs today.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_embedder_produces_unit_vectors() {
+        let path = match std::env::var("NOMIC_ONNX_PATH") {
+            Ok(p) => p,
+            Err(_) => { println!("SKIP: NOMIC_ONNX_PATH not set"); return; }
+        };
+        let embedder = match Embedder::load(Path::new(&path), None, std::time::Duration::from_secs(30)) {
+            Ok(e) => e,
+            Err(e) => { println!("SKIP: CUDA embedder failed to load ({e}); GPU runtime likely absent"); return; }
+        };
+        let texts = vec!["hello world"];
+        let vecs  = embedder.embed(&texts, "search_document: ").unwrap();
+        assert_eq!(vecs.shape(), &[1, EMBEDDING_DIM]);
+        let norm: f32 = vecs.row(0).dot(&vecs.row(0)).sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm = {}", norm);
     }
 
     #[test]
