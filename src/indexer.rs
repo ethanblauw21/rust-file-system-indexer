@@ -13,7 +13,9 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use ndarray::Array2;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -381,6 +383,93 @@ where
     }
 }
 
+// ── Profiling (`--profile`) ───────────────────────────────────────────────────
+
+/// Cumulative per-stage timing for `index --profile`.
+///
+/// `index_root` overlaps its producer (file I/O + chunking, on a dedicated
+/// rayon pool) with its consumer (SQLite writes + batched embedding + LanceDB
+/// writes) via a bounded channel — see the `phase1`/`rx.recv()` loop. Because
+/// the two sides run CONCURRENTLY, these fields are SUMMED durations-in-stage,
+/// not a partition of wall-clock: they need not (and in practice won't) add up
+/// to the overall wall-clock time. `render` states this explicitly so the
+/// output can't be misread as a wall-clock breakdown.
+///
+/// Entirely optional: `IncrementalIndexer::profile` is `None` by default, and
+/// every call site branches on `if let Some(prof) = &self.profile`, so a
+/// normal (non-profiled) run pays no timing overhead.
+#[derive(Default)]
+pub struct Profile {
+    chunking_ns:     AtomicU64,
+    tokenize_ns:     AtomicU64,
+    inference_ns:    AtomicU64,
+    sqlite_ns:       AtomicU64,
+    lance_ns:        AtomicU64,
+    ivf_ns:          AtomicU64,
+    chunks_embedded: AtomicU64,
+}
+
+impl Profile {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn add_chunking(&self, d: Duration)  { self.chunking_ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed); }
+    fn add_tokenize(&self, d: Duration)  { self.tokenize_ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed); }
+    fn add_inference(&self, d: Duration) { self.inference_ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed); }
+    fn add_sqlite(&self, d: Duration)    { self.sqlite_ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed); }
+    fn add_lance(&self, d: Duration)     { self.lance_ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed); }
+    fn add_ivf(&self, d: Duration)       { self.ivf_ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed); }
+    fn add_chunks_embedded(&self, n: usize) { self.chunks_embedded.fetch_add(n as u64, Ordering::Relaxed); }
+
+    /// Total chunks that went through `Embedder::embed_timed` this run.
+    pub fn chunks_embedded(&self) -> u64 {
+        self.chunks_embedded.load(Ordering::Relaxed)
+    }
+
+    /// Render the accumulated stage totals as a human-readable table.
+    /// `wall` is the overall wall-clock time for the `index_root` call;
+    /// `total_units` is caller-supplied (chunks embedded, or indexed-chunk
+    /// count under `--no-embed`) and only used for the `chunks/sec` line.
+    pub fn render(&self, wall: Duration, total_units: usize) -> String {
+        let stages: [(&str, Duration); 6] = [
+            ("chunking",     Duration::from_nanos(self.chunking_ns.load(Ordering::Relaxed))),
+            ("tokenize",     Duration::from_nanos(self.tokenize_ns.load(Ordering::Relaxed))),
+            ("inference",    Duration::from_nanos(self.inference_ns.load(Ordering::Relaxed))),
+            ("sqlite_write", Duration::from_nanos(self.sqlite_ns.load(Ordering::Relaxed))),
+            ("lance_write",  Duration::from_nanos(self.lance_ns.load(Ordering::Relaxed))),
+            ("ivf_build",    Duration::from_nanos(self.ivf_ns.load(Ordering::Relaxed))),
+        ];
+        let summed: f64 = stages.iter().map(|(_, d)| d.as_secs_f64()).sum();
+
+        let mut out = String::new();
+        out.push_str("=== index --profile ===\n");
+        out.push_str(
+            "note: chunking (producer) runs CONCURRENTLY with tokenize/inference/sqlite_write/\n\
+             lance_write (consumer) — index_root overlaps them via a bounded channel. Stage\n\
+             totals below are cumulative time-in-stage (summed across all files/batches), NOT a\n\
+             partition of wall-clock, and need not sum to it.\n\n",
+        );
+        for (name, d) in &stages {
+            let pct = if summed > 0.0 { d.as_secs_f64() / summed * 100.0 } else { 0.0 };
+            out.push_str(&format!(
+                "  {name:<12} {seconds:>10.3}s  {pct:>6.1}% of summed stage time\n",
+                name = name, seconds = d.as_secs_f64(), pct = pct
+            ));
+        }
+        out.push_str(&format!(
+            "  {name:<12} {seconds:>10.3}s  (sum of all stages above)\n",
+            name = "summed", seconds = summed
+        ));
+        out.push('\n');
+        out.push_str(&format!("  wall-clock     {:>10.3}s\n", wall.as_secs_f64()));
+        out.push_str(&format!("  chunks         {total_units:>10}\n"));
+        let per_sec = if wall.as_secs_f64() > 0.0 { total_units as f64 / wall.as_secs_f64() } else { 0.0 };
+        out.push_str(&format!("  chunks/sec     {per_sec:>10.1}\n"));
+        out
+    }
+}
+
 pub struct Embedder {
     session:   Mutex<ort::session::Session>,
     tokenizer: tokenizers::Tokenizer,
@@ -392,22 +481,41 @@ impl Embedder {
     /// it can hang indefinitely inside the native `GetApi()` call (see dogfood doc
     /// Defect 1), which would otherwise wedge the whole `index`/`search` command
     /// with no diagnostic. `ort_dylib_path` overrides `ORT_DYLIB_PATH` when set.
+    /// `model_file` names the ONNX file within `onnx_dir` (e.g.
+    /// `nomic-embed-text-v1.5.onnx` or, for the CUDA EP, `model_fp16.onnx` —
+    /// see ADR-006). The tokenizer filename is always `tokenizer.json`.
     pub fn load(
         onnx_dir: &Path,
+        model_file: &str,
         ort_dylib_path: Option<&str>,
         load_timeout: std::time::Duration,
     ) -> Result<Self, IndexerError> {
         let onnx_dir = onnx_dir.to_path_buf();
+        let model_file = model_file.to_string();
         let ort_dylib_path = ort_dylib_path.map(str::to_string);
         run_with_timeout(load_timeout, move || {
-            Self::load_inner(&onnx_dir, ort_dylib_path.as_deref())
+            Self::load_inner(&onnx_dir, &model_file, ort_dylib_path.as_deref())
         })
     }
 
-    fn load_inner(onnx_dir: &Path, ort_dylib_path: Option<&str>) -> Result<Self, IndexerError> {
+    /// ADR-006 Phase 1: when built with `--features cuda`, this registers the
+    /// ONNX Runtime CUDA execution provider on the `SessionBuilder` before the
+    /// CPU-only fallback path would otherwise run. Registration happens INSIDE
+    /// `load_inner`, which `load` already wraps in `run_with_timeout`, so a
+    /// CUDA init hang (missing driver, mismatched CUDA/cuDNN) is bounded by the
+    /// same load timeout as the existing ORT-DLL-version defect instead of
+    /// wedging indefinitely.
+    ///
+    /// `.error_on_failure()` is deliberate: `ort`'s default is to *silently*
+    /// fall back to CPU if EP registration fails. A `cuda`-featured build that
+    /// secretly ran on CPU would corrupt the throughput measurement this ADR
+    /// is gated on (see docs/adr/ADR-006-cuda-embedding-execution-provider.md),
+    /// so a CUDA registration failure must surface as a named
+    /// `IndexerError::Embedding`, never a quiet no-op.
+    fn load_inner(onnx_dir: &Path, model_file: &str, ort_dylib_path: Option<&str>) -> Result<Self, IndexerError> {
         use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 
-        let model_path = onnx_dir.join("nomic-embed-text-v1.5.onnx");
+        let model_path = onnx_dir.join(model_file);
         let tok_path   = onnx_dir.join("tokenizer.json");
 
         let ort_dll = ort_dylib_path.map(str::to_string)
@@ -417,10 +525,25 @@ impl Embedder {
             .map_err(|e| IndexerError::Embedding(format!("ORT DLL load failed: {e}")))?
             .commit();
 
-        let session = SessionBuilder::new()
+        #[allow(unused_mut)] // `mut` is only exercised by with_execution_providers under --features cuda
+        let mut builder = SessionBuilder::new()
             .map_err(|e| IndexerError::Embedding(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| IndexerError::Embedding(e.to_string()))?
+            .map_err(|e| IndexerError::Embedding(e.to_string()))?;
+
+        #[cfg(feature = "cuda")]
+        {
+            builder = builder
+                .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+                .map_err(|e| IndexerError::Embedding(format!(
+                    "CUDA execution provider failed to register (built with --features cuda). \
+                     Likely cause: missing/mismatched GPU onnxruntime build (need \
+                     onnxruntime_providers_cuda.dll for onnxruntime 1.24.x / ort 2.0.0-rc.12), CUDA \
+                     Toolkit 12.x, or cuDNN 9.x on PATH/ORT_DYLIB_PATH dir. Underlying error: {e}"
+                )))?;
+        }
+
+        let session = builder
             .commit_from_file(&model_path)
             .map_err(|e| IndexerError::Embedding(e.to_string()))?;
 
@@ -452,9 +575,22 @@ impl Embedder {
         texts:  &[&str],
         prefix: &str,
     ) -> Result<Array2<f32>, IndexerError> {
+        self.embed_timed(texts, prefix).map(|(vecs, _)| vecs)
+    }
+
+    /// Same as `embed`, but also returns a `tokenize`/`inference` split for
+    /// `index --profile`. `tokenize` covers `encode_batch`; `inference` covers
+    /// everything after it (tensor build, `session.run`, mean-pool, normalise)
+    /// — the part a CUDA execution provider would move to the GPU (ADR-006).
+    pub fn embed_timed(
+        &self,
+        texts:  &[&str],
+        prefix: &str,
+    ) -> Result<(Array2<f32>, EmbedTimings), IndexerError> {
         if texts.is_empty() {
-            return Array2::from_shape_vec((0, EMBEDDING_DIM), vec![])
-                .map_err(|e| IndexerError::Embedding(e.to_string()));
+            let vecs = Array2::from_shape_vec((0, EMBEDDING_DIM), vec![])
+                .map_err(|e| IndexerError::Embedding(e.to_string()))?;
+            return Ok((vecs, EmbedTimings { tokenize: Duration::ZERO, inference: Duration::ZERO }));
         }
 
         // Sort by length to minimise padding (same optimisation as Python)
@@ -467,10 +603,13 @@ impl Embedder {
 
         let sorted_texts: Vec<&str> = indexed.iter().map(|(_, t)| t.as_str()).collect();
 
+        let t_tokenize = Instant::now();
         let encodings = self.tokenizer
             .encode_batch(sorted_texts, true)
             .map_err(|e| IndexerError::Embedding(e.to_string()))?;
+        let tokenize = t_tokenize.elapsed();
 
+        let t_inference = Instant::now();
         let batch_size = encodings.len();
         let seq_len    = encodings[0].get_ids().len();
 
@@ -560,9 +699,20 @@ impl Embedder {
             }
         }
 
-        Array2::from_shape_vec((b, EMBEDDING_DIM), result_flat)
-            .map_err(|e| IndexerError::Embedding(e.to_string()))
+        let vecs = Array2::from_shape_vec((b, EMBEDDING_DIM), result_flat)
+            .map_err(|e| IndexerError::Embedding(e.to_string()))?;
+        let inference = t_inference.elapsed();
+
+        Ok((vecs, EmbedTimings { tokenize, inference }))
     }
+}
+
+/// `tokenize`/`inference` split for a single `Embedder::embed_timed` call.
+/// See `Profile` for how these accumulate across an `index --profile` run.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedTimings {
+    pub tokenize:  Duration,
+    pub inference: Duration,
 }
 
 // ── Reservoir sampling ────────────────────────────────────────────────────────
@@ -701,6 +851,10 @@ pub struct IncrementalIndexer {
     /// Overridable by the caller after construction (e.g. `index --embed-batch-size`).
     pub embed_batch_size: usize,
     embedder:             Option<Arc<Embedder>>,
+    /// `index --profile` accumulator. `None` on a normal run — every timing
+    /// call site branches on `if let Some(prof) = &self.profile`, so a
+    /// non-profiled run pays no timing overhead. Set via `with_profile`.
+    profile:              Option<Arc<Profile>>,
 }
 
 impl IncrementalIndexer {
@@ -729,13 +883,16 @@ impl IncrementalIndexer {
 
         let onnx_dir = raw_config.embedder.onnx_model_dir.clone()
             .or_else(|| std::env::var("NOMIC_ONNX_PATH").ok());
+        let onnx_model_file = raw_config.embedder.onnx_model_file.clone()
+            .or_else(|| std::env::var("NOMIC_ONNX_FILE").ok())
+            .unwrap_or_else(|| "nomic-embed-text-v1.5.onnx".to_string());
         let ort_dylib = raw_config.embedder.ort_dylib_path.clone()
             .or_else(|| std::env::var("ORT_DYLIB_PATH").ok());
         let ort_load_timeout = std::time::Duration::from_secs(
             raw_config.embedder.load_timeout_secs.unwrap_or(30)
         );
         let embedder = onnx_dir
-            .and_then(|p| Embedder::load(Path::new(&p), ort_dylib.as_deref(), ort_load_timeout).ok())
+            .and_then(|p| Embedder::load(Path::new(&p), &onnx_model_file, ort_dylib.as_deref(), ort_load_timeout).ok())
             .map(Arc::new);
 
         Ok(Self {
@@ -747,6 +904,7 @@ impl IncrementalIndexer {
             index_dir: index_dir.to_path_buf(),
             embed_batch_size,
             embedder,
+            profile: None,
         })
     }
 
@@ -757,6 +915,14 @@ impl IncrementalIndexer {
     #[cfg(test)]
     pub(crate) fn with_embedder_for_test(mut self, embedder: Option<Arc<Embedder>>) -> Self {
         self.embedder = embedder;
+        self
+    }
+
+    /// Enable per-stage timing for `index --profile`. See `Profile` for what
+    /// is measured and why stage totals overlap rather than partition
+    /// wall-clock.
+    pub fn with_profile(mut self, profile: Arc<Profile>) -> Self {
+        self.profile = Some(profile);
         self
     }
 
@@ -807,6 +973,7 @@ impl IncrementalIndexer {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FileAction>(256);
         let storage_bg    = self.storage.clone();
         let chunker_map_bg = self.chunker_map.clone();
+        let profile_bg    = self.profile.clone();
 
         let phase1 = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
@@ -825,9 +992,19 @@ impl IncrementalIndexer {
             pool.install(|| {
                 file_uris.par_iter().for_each(|uri| {
                     let info = stored_info_bg.get(uri.as_str());
-                    let action = process_file_sync(
-                        storage_bg.as_ref(), &FileChunker::new(), &chunker_map_bg, uri, info,
-                    );
+                    let action = match &profile_bg {
+                        Some(prof) => {
+                            let t0 = Instant::now();
+                            let action = process_file_sync(
+                                storage_bg.as_ref(), &FileChunker::new(), &chunker_map_bg, uri, info,
+                            );
+                            prof.add_chunking(t0.elapsed());
+                            action
+                        }
+                        None => process_file_sync(
+                            storage_bg.as_ref(), &FileChunker::new(), &chunker_map_bg, uri, info,
+                        ),
+                    };
                     let _ = tx.blocking_send(action);
                 });
             });
@@ -849,12 +1026,26 @@ impl IncrementalIndexer {
                         let old_lance_ids = self.db.get_lance_ids_for_file(file_id)?;
                         self.vectors.remove_ids(&old_lance_ids).await?;
                     }
-                    self.write_file(
-                        &meta, &hash, chunk_result, &chunker_method,
-                        &serde_json::Value::Null,
-                        &mut text_buffer, &mut lance_id_buf,
-                        &mut chunk_id_buf, &mut tier_buf,
-                    )?;
+                    match &self.profile {
+                        Some(prof) => {
+                            let t0 = Instant::now();
+                            self.write_file(
+                                &meta, &hash, chunk_result, &chunker_method,
+                                &serde_json::Value::Null,
+                                &mut text_buffer, &mut lance_id_buf,
+                                &mut chunk_id_buf, &mut tier_buf,
+                            )?;
+                            prof.add_sqlite(t0.elapsed());
+                        }
+                        None => {
+                            self.write_file(
+                                &meta, &hash, chunk_result, &chunker_method,
+                                &serde_json::Value::Null,
+                                &mut text_buffer, &mut lance_id_buf,
+                                &mut chunk_id_buf, &mut tier_buf,
+                            )?;
+                        }
+                    }
                     stats.indexed += 1;
 
                     if !no_embed && text_buffer.len() >= self.embed_batch_size {
@@ -889,7 +1080,16 @@ impl IncrementalIndexer {
         let ntotal = self.vectors.ntotal().await?;
         if ntotal >= TRAIN_MIN {
             let nlist = compute_nlist(ntotal);
-            let _ = self.vectors.create_ivf_pq_index(nlist).await;
+            match &self.profile {
+                Some(prof) => {
+                    let t0 = Instant::now();
+                    let _ = self.vectors.create_ivf_pq_index(nlist).await;
+                    prof.add_ivf(t0.elapsed());
+                }
+                None => {
+                    let _ = self.vectors.create_ivf_pq_index(nlist).await;
+                }
+            }
         }
 
         // Remove files no longer on disk, including their LanceDB vectors (issue: ghost vectors).
@@ -1166,19 +1366,35 @@ impl IncrementalIndexer {
             let batch_n      = batch_owned.len();
             tracing::info!("Embedding batch {}/{} ({} chunks)", i / self.embed_batch_size + 1, texts.len().div_ceil(self.embed_batch_size), batch_n);
             let emb          = embedder.clone();
-            let vecs         = tokio::task::spawn_blocking(move || {
+            let (vecs, timings) = tokio::task::spawn_blocking(move || {
                 let batch_refs: Vec<&str> = batch_owned.iter().map(String::as_str).collect();
-                emb.embed(&batch_refs, "search_document: ")
+                emb.embed_timed(&batch_refs, "search_document: ")
             })
             .await
             .map_err(|e| IndexerError::Embedding(e.to_string()))??;
+            if let Some(prof) = &self.profile {
+                prof.add_tokenize(timings.tokenize);
+                prof.add_inference(timings.inference);
+                prof.add_chunks_embedded(batch_n);
+            }
             tracing::info!("Embedded {} chunks", batch_n);
             let flat_vecs: Vec<Vec<f32>> = (0..vecs.nrows())
                 .map(|r| vecs.row(r).to_vec())
                 .collect();
-            self.vectors
-                .add_vectors(&lance_ids[i..end], &chunk_ids[i..end], &tiers[i..end], &flat_vecs)
-                .await?;
+            match &self.profile {
+                Some(prof) => {
+                    let t0 = Instant::now();
+                    self.vectors
+                        .add_vectors(&lance_ids[i..end], &chunk_ids[i..end], &tiers[i..end], &flat_vecs)
+                        .await?;
+                    prof.add_lance(t0.elapsed());
+                }
+                None => {
+                    self.vectors
+                        .add_vectors(&lance_ids[i..end], &chunk_ids[i..end], &tiers[i..end], &flat_vecs)
+                        .await?;
+                }
+            }
             // Set lance_ids in SQLite only after the LanceDB write succeeds.
             // This makes lance_id IS NULL the reliable crash-detection signal.
             let id_map: HashMap<i64, i64> = chunk_ids[i..end].iter().copied()
@@ -1248,7 +1464,8 @@ mod tests {
 
     fn load_embedder() -> Option<Embedder> {
         let path = std::env::var("NOMIC_ONNX_PATH").ok()?;
-        Embedder::load(Path::new(&path), None, std::time::Duration::from_secs(30)).ok()
+        let model_file = std::env::var("NOMIC_ONNX_FILE").unwrap_or_else(|_| "nomic-embed-text-v1.5.onnx".into());
+        Embedder::load(Path::new(&path), &model_file, None, std::time::Duration::from_secs(30)).ok()
     }
 
     #[test]
@@ -1281,6 +1498,31 @@ mod tests {
             let cosine: f32 = batch.row(i).dot(&single.row(0));
             assert!(cosine > 0.95, "batch vs single cosine similarity too low for '{}': {}", t, cosine);
         }
+    }
+
+    /// ADR-006 Phase 1: compile-only on the default build (gated behind
+    /// `--features cuda`); auto-skips at runtime when there's no GPU/CUDA
+    /// toolkit present, mirroring `load_embedder`'s skip pattern above. This
+    /// machine has no CUDA Toolkit/cuDNN installed, so `Embedder::load` is
+    /// expected to error here — the skip path, not the assertion path, is
+    /// what actually runs today.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_embedder_produces_unit_vectors() {
+        let path = match std::env::var("NOMIC_ONNX_PATH") {
+            Ok(p) => p,
+            Err(_) => { println!("SKIP: NOMIC_ONNX_PATH not set"); return; }
+        };
+        let model_file = std::env::var("NOMIC_ONNX_FILE").unwrap_or_else(|_| "nomic-embed-text-v1.5.onnx".into());
+        let embedder = match Embedder::load(Path::new(&path), &model_file, None, std::time::Duration::from_secs(30)) {
+            Ok(e) => e,
+            Err(e) => { println!("SKIP: CUDA embedder failed to load ({e}); GPU runtime likely absent"); return; }
+        };
+        let texts = vec!["hello world"];
+        let vecs  = embedder.embed(&texts, "search_document: ").unwrap();
+        assert_eq!(vecs.shape(), &[1, EMBEDDING_DIM]);
+        let norm: f32 = vecs.row(0).dot(&vecs.row(0)).sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm = {}", norm);
     }
 
     #[test]
@@ -1559,6 +1801,51 @@ mod tests {
             chunks.iter().all(|c| c.lance_id.is_none()),
             "no chunk should have a lance_id when --no-embed was used"
         );
+    }
+
+    #[tokio::test]
+    async fn index_root_profile_records_chunking_and_sqlite_stages() {
+        use crate::storage::LocalStorageClient;
+
+        let root_dir = TempDir::new().unwrap();
+        let idx_dir  = TempDir::new().unwrap();
+        std::fs::write(root_dir.path().join("hello.txt"), b"hello world").unwrap();
+        std::fs::write(root_dir.path().join("second.txt"), b"more content here").unwrap();
+
+        let storage = Arc::new(LocalStorageClient::new());
+        let profile = Arc::new(Profile::new());
+        let indexer = IncrementalIndexer::new(storage, idx_dir.path(), false)
+            .await.unwrap()
+            .with_embedder_for_test(None)
+            .with_profile(profile.clone());
+
+        let t0 = std::time::Instant::now();
+        let result = indexer
+            .index_root(&root_dir.path().to_string_lossy(), false, true, None, None)
+            .await;
+        assert!(result.is_ok(), "no-embed indexing under --profile should still succeed: {:?}", result.err());
+        let stats = result.unwrap();
+
+        // Chunking runs in the producer (rayon pool) and sqlite writes in the
+        // consumer for every processed file, so both accumulators must be
+        // nonzero after indexing two real files.
+        assert!(
+            profile.chunking_ns.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "chunking_ns should be nonzero after indexing files"
+        );
+        assert!(
+            profile.sqlite_ns.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "sqlite_ns should be nonzero after indexing files"
+        );
+        // --no-embed means no chunks went through the embedder.
+        assert_eq!(profile.chunks_embedded(), 0, "no chunks should be embedded under --no-embed");
+
+        let rendered = profile.render(t0.elapsed(), stats.indexed);
+        for label in ["chunking", "tokenize", "inference", "sqlite_write", "lance_write", "ivf_build"] {
+            assert!(rendered.contains(label), "render() output should mention stage '{}': {}", label, rendered);
+        }
+        assert!(rendered.contains("wall-clock"), "render() output should report wall-clock: {}", rendered);
+        assert!(rendered.contains("chunks/sec"), "render() output should report chunks/sec: {}", rendered);
     }
 
     #[tokio::test]

@@ -28,6 +28,13 @@ pub struct RawConfig {
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct RawEmbedderConfig {
     pub onnx_model_dir: Option<String>,
+    /// ONNX model filename within `onnx_model_dir`, e.g. `model_fp16.onnx` to
+    /// select the fp16 export for the CUDA/GPU execution provider (ADR-006 —
+    /// the default int8-quantized export forces ~156 CPU-fallback memcpy nodes
+    /// on the CUDA EP, ~20x slower). Falls back to the `NOMIC_ONNX_FILE` env
+    /// var, then to `"nomic-embed-text-v1.5.onnx"`. The tokenizer filename
+    /// (`tokenizer.json`) is fixed — it's shared across precisions.
+    pub onnx_model_file: Option<String>,
     pub ort_dylib_path: Option<String>,
     pub embedding_dim: Option<usize>,
     /// Reserved: not yet enforced anywhere (would require probing the loaded
@@ -141,6 +148,17 @@ mod tests {
         let cfg = RawConfig::load(dir.path()).unwrap();
         assert!(cfg.embedder.onnx_model_dir.is_none());
         assert!(cfg.indexer.embed_batch_size.is_none());
+    }
+
+    #[test]
+    fn config_load_reads_onnx_model_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("file_indexer.toml"),
+            "[embedder]\nonnx_model_file = \"model_fp16.onnx\"\n",
+        ).unwrap();
+        let cfg = RawConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.embedder.onnx_model_file.as_deref(), Some("model_fp16.onnx"));
     }
 
     #[test]

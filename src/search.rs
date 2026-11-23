@@ -145,11 +145,14 @@ impl Searcher {
 
         let onnx_dir = raw_config.embedder.onnx_model_dir.clone()
             .or_else(|| std::env::var("NOMIC_ONNX_PATH").ok());
+        let onnx_model_file = raw_config.embedder.onnx_model_file.clone()
+            .or_else(|| std::env::var("NOMIC_ONNX_FILE").ok())
+            .unwrap_or_else(|| "nomic-embed-text-v1.5.onnx".to_string());
         let ort_dylib = raw_config.embedder.ort_dylib_path.clone()
             .or_else(|| std::env::var("ORT_DYLIB_PATH").ok());
         let ort_load_timeout = std::time::Duration::from_secs(raw_config.embedder.load_timeout_secs.unwrap_or(30));
         let embedder = onnx_dir
-            .and_then(|p| Embedder::load(Path::new(&p), ort_dylib.as_deref(), ort_load_timeout).ok())
+            .and_then(|p| Embedder::load(Path::new(&p), &onnx_model_file, ort_dylib.as_deref(), ort_load_timeout).ok())
             .map(Arc::new);
 
         Ok(Self { db, vectors, embedder, fusion_defaults })
