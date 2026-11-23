@@ -1,0 +1,3 @@
+[env]
+# A global AR (e.g. a launcher dir) hijacks cc's archiver; an empty AR_<target> takes precedence and makes cc fall back to its default (lib.exe on MSVC).
+"AR_x86_64-pc-windows-msvc" = ""
