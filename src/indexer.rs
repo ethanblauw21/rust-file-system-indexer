@@ -575,7 +575,7 @@ pub fn update_reservoir(
     new_texts:  &[String],
     total_seen: &mut usize,
 ) {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     for text in new_texts {
         *total_seen += 1;
@@ -1196,7 +1196,7 @@ fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut h = Md5::new();
     h.update(data);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// Shallow-merge caller-supplied record metadata into a chunk's chunker-derived
