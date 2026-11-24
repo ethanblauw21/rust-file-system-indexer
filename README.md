@@ -58,7 +58,7 @@ platform shared library (`onnxruntime.dll` / `.so` / `.dylib`), loaded dynamical
 #### Telling `file_indexer` where these live
 
 Point at directory 1+2 and file 3 in **either** of two ways (CLI-flag override doesn't exist for these
-paths; see `CLAUDE.md`'s "Configuration file" design-decision bullet for the exact resolution order and
+paths; see `docs/agents/design-decisions.md` ("Configuration file" bullet) for the exact resolution order and
 the other config sections):
 
 - **`file_indexer.toml`** (checked at `<index_dir>/file_indexer.toml`, then `./file_indexer.toml`):
@@ -71,7 +71,7 @@ the other config sections):
   `NOMIC_ONNX_PATH` (directory) and `ORT_DYLIB_PATH` (file path).
 
 If neither is set, `index` **hard-errors** by default — pass `--no-embed` to build a sparse-only (BM25)
-index instead of failing (see `CLAUDE.md` for what `--no-embed` records and how `search`/`score` report it).
+index instead of failing (see `docs/agents/design-decisions.md` for what `--no-embed` records and how `search`/`score` report it).
 
 #### Optional setup script
 
@@ -197,7 +197,7 @@ Each query runs against both backends, then the results are fused:
 **Not currently parallel.** `hybrid_search` builds the dense-search future first, then runs the sparse
 (FTS5) query synchronously to completion, and only then awaits the dense future (`src/search.rs:520-525`).
 Because Rust futures are lazy, nothing overlaps — the two channels run back-to-back on one task despite
-the function being `async`. See `CLAUDE.md`'s "Known Limitations" section for the recommended
+the function being `async`. See `docs/agents/known-limitations.md` for the recommended
 `tokio::join!` + `spawn_blocking` fix (not yet implemented; would change latency, not fusion results).
 
 IVF partition count (`nlist`) is computed dynamically as `clamp(4√N, 4, 1024)` — prevents under-partitioning on large indexes. For N=9,000 vectors this yields ~380 partitions vs. a naive fixed 32.
@@ -244,7 +244,7 @@ compiled dimension, it just hard-errors at startup if it disagrees with it.
 | `db.rs` | SQLite schema, r2d2 pool, FTS5 virtual table with sync triggers |
 | `chunker.rs` | 3-tier MIME-aware chunking pipeline |
 | `chunker_map.rs` | Track which chunker was used per file |
-| `config.rs` | `file_indexer.toml` loader (config-file > env-var-fallback / CLI > default resolution — see `CLAUDE.md`) |
+| `config.rs` | `file_indexer.toml` loader (config-file > env-var-fallback / CLI > default resolution — see `docs/agents/design-decisions.md`) |
 | `indexer.rs` | `IncrementalIndexer` — list → chunk → embed → store pipeline; hard-errors on a missing embedder unless `--no-embed` |
 | `search.rs` | Hybrid RRF searcher, query builder (dense + sparse run sequentially, not in parallel — see Hybrid Search above) |
 | `scorer.rs` | Chunk quality scoring (structural heuristics + coherence metrics) |
@@ -280,12 +280,12 @@ cargo build --release
 - **Zero-copy chunking** — `Bytes` (ref-counted) is used instead of `Vec<u8>` so chunker parsers hold zero-copy slices of the same buffer.
 - **`StorageClient` trait** — Object-safe (`Box<dyn ...>`). `LocalStorageClient` is the current backend; a `GoogleDriveStorageClient` is planned for Phase 2.
 - **`lance_id` invariant** — The `lance_id` stored in `chunks` (SQLite) must equal the `id` column in LanceDB for every chunk. This invariant underpins RRF fusion at query time.
-- **Configuration file** — `file_indexer.toml`, loaded from `<index_dir>/file_indexer.toml` then `./file_indexer.toml`, else built-in defaults. Model paths configure here (or via `NOMIC_ONNX_PATH`/`ORT_DYLIB_PATH` as a fallback) — see "Model Setup" above and `CLAUDE.md`'s "Configuration file" bullet for the full precedence rules per section.
+- **Configuration file** — `file_indexer.toml`, loaded from `<index_dir>/file_indexer.toml` then `./file_indexer.toml`, else built-in defaults. Model paths configure here (or via `NOMIC_ONNX_PATH`/`ORT_DYLIB_PATH` as a fallback) — see "Model Setup" above and `docs/agents/design-decisions.md`'s "Configuration file" bullet for the full precedence rules per section.
 - **`--no-embed`** — `index` hard-errors if no embedder is configured, unless `--no-embed` is passed; the choice is recorded (`embed_mode` in the index) so `search`/`score` report a degraded corpus explicitly instead of silently returning empty dense results.
 
 ## Known Limitations
 
-- **Hybrid search's dense and sparse channels run sequentially, not in parallel** — see "Hybrid Search" above and `CLAUDE.md` for the recommended (not yet implemented) `tokio::join!`/`spawn_blocking` fix.
+- **Hybrid search's dense and sparse channels run sequentially, not in parallel** — see "Hybrid Search" above and `docs/agents/known-limitations.md` for the recommended (not yet implemented) `tokio::join!`/`spawn_blocking` fix.
 - **`[embedder].required_onnxruntime_version` in `file_indexer.toml` is parsed but not enforced** — nothing currently checks the loaded ORT dylib's version against it; the only mismatch protection today is the load-timeout described in "Model Setup" above.
 
 ## Roadmap
